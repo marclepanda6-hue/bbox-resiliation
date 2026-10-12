@@ -8,24 +8,21 @@ import os
 import logging
 import re
 import ipaddress
-import secrets
 import hmac
 import asyncio
+import csv
+import io
 from zoneinfo import ZoneInfo
-from html import escape
-from html.parser import HTMLParser
-from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, List
 
 import bcrypt
 import jwt
-import httpx
 from bson import ObjectId
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, UploadFile, File
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -36,172 +33,8 @@ app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 JWT_ALGORITHM = "HS256"
-MAX_FAILED = 5
+MAX_FAILED = 10
 LOCKOUT_MINUTES = 15
-
-# ---------- email (Emergent managed Resend) ----------
-EMAIL_BASE_URL = "https://integrations.emergentagent.com"
-EMAIL_KEY = os.environ["EMERGENT_EMAIL_KEY"]
-EMAIL_FROM_NAME = os.environ["EMAIL_FROM_NAME"]
-EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
-
-_SHORTENERS = ("bit.ly", "tinyurl.com", "t.co", "is.gd", "cutt.ly", "goo.gl", "rebrand.ly")
-_CRED_ASK = ("reply with your password", "reply with the code", "send your password", "cvv",
-             "send us your password", "enter your password below", "confirm your card number",
-             "your full card number", "seed phrase", "recovery phrase", "verify your card",
-             "social security number", "confirm your bank details")
-_HOSTISH = re.compile(r"\b(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})", re.I)
-
-
-def _host_ok(host: str) -> bool:
-    if not host or "xn--" in host:
-        return False
-    try:
-        ipaddress.ip_address(host)
-        return False
-    except ValueError:
-        pass
-    return not any(host == s or host.endswith("." + s) for s in _SHORTENERS)
-
-
-def _same_site(shown: str, real: str) -> bool:
-    return shown == real or real.endswith("." + shown) or shown.endswith("." + real)
-
-
-class _EmailScan(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.tags, self.urls, self.anchors = set(), [], []
-        self._href, self._text = None, []
-
-    def handle_starttag(self, tag, attrs):
-        self.tags.add(tag.lower())
-        self.urls += [v for k, v in attrs if k.lower() in ("href", "src") and v]
-        if tag.lower() == "a":
-            self._href = dict((k.lower(), v) for k, v in attrs).get("href")
-            self._text = []
-
-    def handle_data(self, data):
-        if self._href is not None:
-            self._text.append(data)
-
-    def handle_endtag(self, tag):
-        if tag.lower() == "a" and self._href is not None:
-            self.anchors.append((self._href, "".join(self._text)))
-            self._href, self._text = None, []
-
-
-def _assert_safe_email(subject: str, html: str) -> None:
-    scan = _EmailScan()
-    scan.feed(html)
-    if scan.tags & {"form", "input", "textarea", "select"}:
-        raise ValueError("No forms or input fields in email (G2)")
-    body = f"{subject}\n{html}".lower()
-    for p in _CRED_ASK:
-        if p in body:
-            raise ValueError(f"Email asks the recipient for credentials: {p!r} (G2)")
-    for url in scan.urls:
-        low = url.strip().lower()
-        if low.startswith(("mailto:", "tel:", "cid:", "#")):
-            continue
-        if not low.startswith("https://"):
-            raise ValueError(f"Email links/assets must be absolute https: {url!r} (G3)")
-        host = urlparse(low).hostname or ""
-        if not _host_ok(host) or urlparse(low).username is not None:
-            raise ValueError(f"Shortened, numeric-host or credential-bearing URL: {url!r} (G3)")
-    for href, text in scan.anchors:
-        real = urlparse(href.strip().lower()).hostname or ""
-        if not real:
-            continue
-        for m in _HOSTISH.finditer(text):
-            if not _same_site(m.group(1).lower(), real):
-                raise ValueError(f"Anchor text {m.group(1)!r} != real link host {real!r} (G3)")
-
-
-async def send_email(*, to: str, subject: str, html: str) -> Optional[str]:
-    _assert_safe_email(subject, html)
-    payload = {"to": [to], "subject": subject, "html": html, "from_name": EMAIL_FROM_NAME}
-    if EMAIL_REPLY_TO:
-        payload["contact_email"] = EMAIL_REPLY_TO
-    try:
-        async with httpx.AsyncClient(timeout=30) as http_client:
-            resp = await http_client.post(
-                f"{EMAIL_BASE_URL}/api/v1/email/send",
-                headers={"X-Email-Key": EMAIL_KEY},
-                json=payload,
-            )
-        resp.raise_for_status()
-        return resp.json().get("id")
-    except httpx.HTTPStatusError as e:
-        try:
-            code = e.response.json().get("code", "")
-        except ValueError:
-            code = ""
-        if code in ("insufficient_credits", "integration_disabled", "daily_limit_reached"):
-            logger.warning(f"Email paused: {code} ({e.response.status_code})")
-            raise HTTPException(status_code=503, detail="Email is temporarily unavailable")
-        logger.error(f"Email send failed: {e.response.status_code} {e.response.text}")
-        raise HTTPException(status_code=502, detail="Failed to send email")
-    except Exception as e:
-        logger.error(f"Email send error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to send email")
-
-
-def build_reset_email_html(reset_url: str) -> str:
-    return (
-        '<table role="presentation" width="100%" style="background:#eef3f7;padding:24px">'
-        '<tr><td align="center">'
-        '<table role="presentation" width="480" style="background:#ffffff;border-radius:16px;'
-        'font-family:Arial,Helvetica,sans-serif">'
-        '<tr><td style="padding:32px 32px 8px">'
-        f'<p style="font-size:20px;font-weight:bold;color:#164194;margin:0">{escape(EMAIL_FROM_NAME)}</p>'
-        '</td></tr>'
-        '<tr><td style="padding:8px 32px">'
-        '<h1 style="font-size:22px;color:#17334d;margin:0 0 12px">Réinitialisation de votre mot de passe</h1>'
-        '<p style="font-size:15px;color:#5a6b7a;line-height:1.6;margin:0 0 20px">'
-        'Vous avez demandé à réinitialiser votre mot de passe. Cliquez sur le bouton '
-        'ci-dessous pour en choisir un nouveau. Ce lien expire dans 1 heure.</p>'
-        f'<p style="margin:0 0 24px"><a href="{escape(reset_url)}" '
-        'style="background:#c4521f;color:#ffffff;text-decoration:none;font-weight:bold;'
-        'padding:14px 28px;border-radius:999px;display:inline-block;font-size:15px">'
-        'Choisir un nouveau mot de passe</a></p>'
-        '<p style="font-size:13px;color:#8a98a6;line-height:1.5;margin:0">'
-        "Si vous n'êtes pas à l'origine de cette demande, ignorez cet e-mail. "
-        'Nous ne vous demanderons jamais votre mot de passe par e-mail.</p>'
-        '</td></tr>'
-        '<tr><td style="padding:24px 32px;border-top:1px solid #eef3f7">'
-        f'<p style="font-size:12px;color:#8a98a6;margin:0">Envoyé par {escape(EMAIL_FROM_NAME)}.</p>'
-        '</td></tr></table></td></tr></table>'
-    )
-
-
-def build_welcome_email_html() -> str:
-    login_url = f"{FRONTEND_URL}/"
-    return (
-        '<table role="presentation" width="100%" style="background:#eef3f7;padding:24px">'
-        '<tr><td align="center">'
-        '<table role="presentation" width="480" style="background:#ffffff;border-radius:16px;'
-        'font-family:Arial,Helvetica,sans-serif">'
-        '<tr><td style="padding:32px 32px 8px">'
-        f'<p style="font-size:20px;font-weight:bold;color:#164194;margin:0">{escape(EMAIL_FROM_NAME)}</p>'
-        '</td></tr>'
-        '<tr><td style="padding:8px 32px">'
-        '<h1 style="font-size:22px;color:#17334d;margin:0 0 12px">Bienvenue sur votre espace client</h1>'
-        '<p style="font-size:15px;color:#5a6b7a;line-height:1.6;margin:0 0 20px">'
-        'Votre compte a bien été créé. Vous pouvez dès maintenant vous connecter pour gérer '
-        'vos offres, vos factures et vos abonnements.</p>'
-        f'<p style="margin:0 0 24px"><a href="{escape(login_url)}" '
-        'style="background:#c4521f;color:#ffffff;text-decoration:none;font-weight:bold;'
-        'padding:14px 28px;border-radius:999px;display:inline-block;font-size:15px">'
-        'Accéder à mon espace client</a></p>'
-        '<p style="font-size:13px;color:#8a98a6;line-height:1.5;margin:0">'
-        'Nous ne vous demanderons jamais votre mot de passe par e-mail.</p>'
-        '</td></tr>'
-        '<tr><td style="padding:24px 32px;border-top:1px solid #eef3f7">'
-        f'<p style="font-size:12px;color:#8a98a6;margin:0">Envoyé par {escape(EMAIL_FROM_NAME)}.</p>'
-        '</td></tr></table></td></tr></table>'
-    )
 
 
 # ---------- helpers ----------
@@ -220,32 +53,32 @@ def get_jwt_secret() -> str:
     return os.environ["JWT_SECRET"]
 
 
-def create_access_token(user_id: str, email: str) -> str:
-    payload = {"sub": user_id, "email": email,
-               "exp": datetime.now(timezone.utc) + timedelta(minutes=15), "type": "access"}
+def create_access_token(sub_id: str, kind: str, role: str) -> str:
+    payload = {
+        "sub": sub_id,
+        "kind": kind,
+        "role": role,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=12),
+        "type": "access",
+    }
     return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
 
 
-def create_refresh_token(user_id: str) -> str:
-    payload = {"sub": user_id,
-               "exp": datetime.now(timezone.utc) + timedelta(days=7), "type": "refresh"}
+def create_refresh_token(sub_id: str, kind: str) -> str:
+    payload = {
+        "sub": sub_id,
+        "kind": kind,
+        "exp": datetime.now(timezone.utc) + timedelta(days=14),
+        "type": "refresh",
+    }
     return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
 
 
 def set_auth_cookies(response: Response, access: str, refresh: str):
     response.set_cookie(key="access_token", value=access, httponly=True, secure=True,
-                        samesite="none", max_age=900, path="/")
+                        samesite="none", max_age=12 * 3600, path="/")
     response.set_cookie(key="refresh_token", value=refresh, httponly=True, secure=True,
-                        samesite="none", max_age=604800, path="/")
-
-
-def mask_iban(iban: str) -> str:
-    if not iban:
-        return ""
-    s = iban.replace(" ", "")
-    if len(s) <= 4:
-        return "•••• " + s
-    return "•••• •••• •••• " + s[-4:]
+                        samesite="none", max_age=14 * 24 * 3600, path="/")
 
 
 def mask_iban_from_last4(last4: str) -> str:
@@ -255,41 +88,59 @@ def mask_iban_from_last4(last4: str) -> str:
     return "•••• •••• •••• " + s[-4:]
 
 
-async def public_user(user: dict) -> dict:
-    # Admin-managed overlay: lookup by email (lowercased); fall back to user record.
-    email = (user.get("email") or "").strip().lower()
-    profile = None
-    if email:
-        profile = await db.customer_profiles.find_one({"identifier": email})
-    # Also allow a phone-based identifier later if the user stored one.
-    phone = (user.get("phone") or "").strip()
-    if not profile and phone:
-        profile = await db.customer_profiles.find_one({"identifier": phone})
+def _normalize_email(raw: str) -> str:
+    return (raw or "").strip().lower()
 
-    name_from_profile = (profile or {}).get("name", "").strip()
-    iban_last4 = ((profile or {}).get("iban_last4") or "").strip()
 
-    display_name = name_from_profile or (
-        " ".join([user.get("prenom", ""), user.get("nom", "")]).strip()
-        or user.get("name", "")
-    )
-    iban_masked = (
-        mask_iban_from_last4(iban_last4)
-        if iban_last4
-        else mask_iban(user.get("iban", ""))
-    )
-    has_iban = bool(iban_last4) or bool(user.get("iban"))
+def _normalize_phone(raw: str) -> str:
+    s = re.sub(r"[^\d+]", "", (raw or "").strip())
+    # If starts with + keep, else strip leading zeros only if length > 10 — keep as-is otherwise
+    return s
 
+
+def _looks_like_email(s: str) -> bool:
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", (s or "").strip()))
+
+
+def _looks_like_phone(s: str) -> bool:
+    digits = re.sub(r"\D", "", s or "")
+    return len(digits) >= 8
+
+
+def _validate_last4(raw: str) -> str:
+    s = re.sub(r"\D", "", raw or "")
+    if s and len(s) != 4:
+        raise HTTPException(
+            status_code=400,
+            detail="Les 4 derniers chiffres de l'IBAN doivent contenir exactement 4 chiffres.",
+        )
+    return s
+
+
+async def public_user(entity: dict) -> dict:
+    """Build the public representation for either an admin user or a customer profile."""
+    kind = entity.get("kind", "user")
+    if kind == "profile":
+        return {
+            "id": str(entity["_id"]),
+            "email": entity.get("email", ""),
+            "phone": entity.get("phone", ""),
+            "name": entity.get("name", "") or "Non renseigné",
+            "iban_masked": mask_iban_from_last4(entity.get("iban_last4", "")),
+            "has_iban": bool(entity.get("iban_last4")),
+            "role": "user",
+            "kind": "profile",
+        }
+    # admin user
     return {
-        "id": str(user["_id"]),
-        "email": user["email"],
-        "name": display_name,
-        "nom": user.get("nom", ""),
-        "prenom": user.get("prenom", ""),
-        "iban_masked": iban_masked,
-        "has_iban": has_iban,
-        "role": user.get("role", "user"),
-        "managed_by_admin": bool(profile),
+        "id": str(entity["_id"]),
+        "email": entity.get("email", ""),
+        "phone": "",
+        "name": entity.get("name", "Admin"),
+        "iban_masked": "",
+        "has_iban": False,
+        "role": entity.get("role", "admin"),
+        "kind": "user",
     }
 
 
@@ -305,35 +156,36 @@ async def get_current_user(request: Request) -> dict:
         payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="Type de jeton invalide")
-        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
-        if not user:
-            raise HTTPException(status_code=401, detail="Utilisateur introuvable")
-        return user
+        kind = payload.get("kind", "user")
+        sub = payload["sub"]
+        if kind == "profile":
+            doc = await db.customer_profiles.find_one({"_id": ObjectId(sub)})
+            if not doc:
+                raise HTTPException(status_code=401, detail="Profil introuvable")
+            doc["kind"] = "profile"
+            return doc
+        else:
+            doc = await db.users.find_one({"_id": ObjectId(sub)})
+            if not doc:
+                raise HTTPException(status_code=401, detail="Utilisateur introuvable")
+            doc["kind"] = "user"
+            return doc
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Session expirée")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Jeton invalide")
 
 
+async def get_admin_user(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("kind") != "user" or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Accès réservé aux administrateurs.")
+    return user
+
+
 # ---------- models ----------
-class RegisterInput(BaseModel):
-    email: str = Field(..., min_length=3)
-    password: str = Field(..., min_length=6)
-    name: Optional[str] = ""
-
-
 class LoginInput(BaseModel):
     email: str
     password: str
-
-
-class ForgotPasswordInput(BaseModel):
-    email: str
-
-
-class ResetPasswordInput(BaseModel):
-    token: str
-    password: str = Field(..., min_length=6)
 
 
 class CancelInput(BaseModel):
@@ -341,10 +193,15 @@ class CancelInput(BaseModel):
     feedback: Optional[str] = ""
 
 
-class ProfileInput(BaseModel):
-    nom: Optional[str] = ""
-    prenom: Optional[str] = ""
-    iban: Optional[str] = ""
+class ProfileAdminInput(BaseModel):
+    email: Optional[str] = ""
+    phone: Optional[str] = ""
+    name: str = Field("", max_length=120)
+    iban_last4: Optional[str] = ""
+
+
+class ProfileImportInput(BaseModel):
+    text: str = Field(..., min_length=1)
 
 
 # ---------- brute force ----------
@@ -372,63 +229,66 @@ async def clear_failures(identifier: str):
     await db.login_attempts.delete_one({"identifier": identifier})
 
 
-# ---------- routes ----------
+# ---------- routes: auth ----------
 @api_router.get("/")
 async def root():
     return {"message": "Bouygues clone API"}
 
 
-@api_router.post("/auth/register")
-async def register(payload: RegisterInput, response: Response):
-    email = payload.email.strip().lower()
-    existing = await db.users.find_one({"email": email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Un compte existe déjà avec cet identifiant.")
-    doc = {
-        "email": email,
-        "password_hash": hash_password(payload.password),
-        "name": payload.name or "",
-        "role": "user",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    result = await db.users.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    access = create_access_token(str(result.inserted_id), email)
-    refresh = create_refresh_token(str(result.inserted_id))
-    set_auth_cookies(response, access, refresh)
-    if "@" in email:
-        try:
-            await send_email(
-                to=email,
-                subject="Bienvenue sur votre espace client",
-                html=build_welcome_email_html(),
-            )
-        except HTTPException as e:
-            logger.warning(f"Welcome email not delivered: {e.detail}")
-    return {"message": "Compte créé avec succès", "user": await public_user(doc)}
-
-
 @api_router.post("/auth/login")
 async def login(payload: LoginInput, request: Request, response: Response):
-    email = payload.email.strip().lower()
+    raw = (payload.email or "").strip()
+    if not raw or not payload.password:
+        raise HTTPException(status_code=400, detail="Identifiant et mot de passe obligatoires.")
+
     ip = request.client.host if request.client else "unknown"
-    identifier = f"{ip}:{email}"
-    await check_lockout(identifier)
+    identifier_key = f"{ip}:{raw.lower()}"
+    await check_lockout(identifier_key)
 
-    user = await db.users.find_one({"email": email})
-    if not user or not verify_password(payload.password, user["password_hash"]):
-        await record_failure(identifier)
-        raise HTTPException(status_code=401, detail="Identifiant ou mot de passe incorrect.")
+    admin_email = _normalize_email(os.environ.get("ADMIN_EMAIL", ""))
+    admin_password = os.environ.get("ADMIN_PASSWORD", "")
 
-    await clear_failures(identifier)
-    access = create_access_token(str(user["_id"]), email)
-    refresh = create_refresh_token(str(user["_id"]))
+    normalized_email = _normalize_email(raw) if "@" in raw else ""
+    normalized_phone = _normalize_phone(raw) if "@" not in raw else ""
+
+    # --- Admin path: strict password ---
+    if admin_email and normalized_email == admin_email:
+        admin_doc = await db.users.find_one({"email": admin_email})
+        if not admin_doc or not verify_password(payload.password, admin_doc["password_hash"]):
+            await record_failure(identifier_key)
+            raise HTTPException(status_code=401, detail="Identifiant ou mot de passe incorrect.")
+        await clear_failures(identifier_key)
+        admin_doc["kind"] = "user"
+        access = create_access_token(str(admin_doc["_id"]), "user", "admin")
+        refresh = create_refresh_token(str(admin_doc["_id"]), "user")
+        set_auth_cookies(response, access, refresh)
+        return {"message": "Connexion réussie", "user": await public_user(admin_doc)}
+
+    # --- Customer profile path: any password accepted if identifier is authorized ---
+    query = {"$or": []}
+    if normalized_email:
+        query["$or"].append({"email": normalized_email})
+    if normalized_phone:
+        query["$or"].append({"phone": normalized_phone})
+    if not query["$or"]:
+        await record_failure(identifier_key)
+        raise HTTPException(status_code=401, detail="Identifiant non autorisé.")
+
+    profile = await db.customer_profiles.find_one(query)
+    if not profile:
+        await record_failure(identifier_key)
+        raise HTTPException(status_code=401, detail="Identifiant non autorisé.")
+
+    await clear_failures(identifier_key)
+    profile["kind"] = "profile"
+    access = create_access_token(str(profile["_id"]), "profile", "user")
+    refresh = create_refresh_token(str(profile["_id"]), "profile")
     set_auth_cookies(response, access, refresh)
-    return {"message": "Connexion réussie", "user": await public_user(user)}
+    return {"message": "Connexion réussie", "user": await public_user(profile)}
 
 
 @api_router.post("/auth/logout")
-async def logout(response: Response, user: dict = Depends(get_current_user)):
+async def logout(response: Response, _: dict = Depends(get_current_user)):
     response.delete_cookie("access_token", path="/")
     response.delete_cookie("refresh_token", path="/")
     return {"message": "Déconnecté"}
@@ -448,66 +308,27 @@ async def refresh_token(request: Request, response: Response):
         payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "refresh":
             raise HTTPException(status_code=401, detail="Type de jeton invalide")
-        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
-        if not user:
-            raise HTTPException(status_code=401, detail="Utilisateur introuvable")
-        access = create_access_token(str(user["_id"]), user["email"])
+        kind = payload.get("kind", "user")
+        sub = payload["sub"]
+        role = "user"
+        if kind == "user":
+            doc = await db.users.find_one({"_id": ObjectId(sub)})
+            if not doc:
+                raise HTTPException(status_code=401, detail="Utilisateur introuvable")
+            role = doc.get("role", "user")
+        else:
+            doc = await db.customer_profiles.find_one({"_id": ObjectId(sub)})
+            if not doc:
+                raise HTTPException(status_code=401, detail="Profil introuvable")
+        access = create_access_token(sub, kind, role)
         response.set_cookie(key="access_token", value=access, httponly=True, secure=True,
-                            samesite="none", max_age=900, path="/")
+                            samesite="none", max_age=12 * 3600, path="/")
         return {"message": "Jeton rafraîchi"}
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Jeton invalide")
 
 
-@api_router.post("/auth/forgot-password")
-async def forgot_password(payload: ForgotPasswordInput):
-    email = payload.email.strip().lower()
-    user = await db.users.find_one({"email": email})
-    # Always return success to avoid user enumeration
-    if user:
-        token = secrets.token_urlsafe(32)
-        await db.password_reset_tokens.insert_one({
-            "email": email,
-            "token": token,
-            "used": False,
-            "expires_at": datetime.now(timezone.utc) + timedelta(hours=1),
-        })
-        reset_url = f"{FRONTEND_URL}/reset-password?token={token}"
-        logger.info(f"Password reset link: {reset_url}")
-        try:
-            await send_email(
-                to=email,
-                subject=f"Réinitialisation de votre mot de passe — {EMAIL_FROM_NAME}",
-                html=build_reset_email_html(reset_url),
-            )
-        except HTTPException as e:
-            # Do not leak email delivery state to the caller; log for the owner.
-            logger.warning(f"Reset email not delivered: {e.detail}")
-    return {"message": "Si un compte existe, un lien de réinitialisation a été envoyé."}
-
-
-@api_router.post("/auth/reset-password")
-async def reset_password(payload: ResetPasswordInput):
-    rec = await db.password_reset_tokens.find_one({"token": payload.token})
-    if not rec or rec.get("used"):
-        raise HTTPException(status_code=400, detail="Lien invalide ou déjà utilisé.")
-    expires = rec.get("expires_at")
-    if isinstance(expires, str):
-        expires = datetime.fromisoformat(expires)
-    if expires and expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    if expires and datetime.now(timezone.utc) > expires:
-        raise HTTPException(status_code=400, detail="Ce lien a expiré. Veuillez refaire une demande.")
-    await db.users.update_one(
-        {"email": rec["email"]},
-        {"$set": {"password_hash": hash_password(payload.password)}},
-    )
-    await db.password_reset_tokens.update_one(
-        {"_id": rec["_id"]}, {"$set": {"used": True}}
-    )
-    return {"message": "Votre mot de passe a été réinitialisé avec succès."}
-
-
+# ---------- routes: subscription ----------
 @api_router.get("/subscription/canal")
 async def canal_status(user: dict = Depends(get_current_user)):
     rec = await db.cancellations.find_one({"user_id": str(user["_id"]), "service": "canal"})
@@ -515,7 +336,6 @@ async def canal_status(user: dict = Depends(get_current_user)):
         "service": "CANAL+",
         "offer": "CANAL+ Ciné Séries",
         "price": "69,99 €/mois",
-        "since": "12 mars 2023",
         "status": "cancellation_requested" if rec else "active",
         "cancellation": {
             "reason": rec.get("reason"),
@@ -534,7 +354,8 @@ async def canal_cancel(payload: CancelInput, user: dict = Depends(get_current_us
     effective = now + timedelta(days=30)
     await db.cancellations.insert_one({
         "user_id": str(user["_id"]),
-        "email": user["email"],
+        "email": user.get("email", ""),
+        "phone": user.get("phone", ""),
         "service": "canal",
         "reason": payload.reason,
         "feedback": payload.feedback or "",
@@ -567,21 +388,6 @@ async def canal_undo(user: dict = Depends(get_current_user)):
     return {"message": "Votre résiliation a été annulée. Votre abonnement reste actif."}
 
 
-@api_router.put("/profile")
-async def update_profile(payload: ProfileInput, user: dict = Depends(get_current_user)):
-    updates = {}
-    if payload.nom is not None:
-        updates["nom"] = payload.nom.strip()
-    if payload.prenom is not None:
-        updates["prenom"] = payload.prenom.strip()
-    if payload.iban is not None:
-        updates["iban"] = payload.iban.replace(" ", "").upper()
-    if updates:
-        await db.users.update_one({"_id": user["_id"]}, {"$set": updates})
-    u = await db.users.find_one({"_id": user["_id"]})
-    return {"user": await public_user(u)}
-
-
 @api_router.get("/prelevements")
 async def list_prelevements(user: dict = Depends(get_current_user)):
     docs = await db.prelevements.find({"user_id": str(user["_id"])}).sort("date", -1).to_list(200)
@@ -594,96 +400,60 @@ async def list_prelevements(user: dict = Depends(get_current_user)):
     }
 
 
-def _check_cron_auth(request: Request):
-    auth = request.headers.get("Authorization", "")
-    token = auth[7:] if auth.startswith("Bearer ") else ""
-    secret = os.environ.get("WEBHOOK_CRON_SECRET", "")
-    if not token or not secret or not hmac.compare_digest(token, secret):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-async def _run_prelevements(day_iso: str):
-    users = await db.users.find({}).to_list(10000)
-    for u in users:
-        exists = await db.prelevements.find_one({"user_id": str(u["_id"]), "date": day_iso})
-        if not exists:
-            await db.prelevements.insert_one({
-                "user_id": str(u["_id"]),
-                "amount": 69.99,
-                "label": "CANAL+ Ciné Séries",
-                "date": day_iso,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            })
-
-
-@api_router.post("/cron/prelevements")
-async def cron_prelevements(request: Request):
-    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
-    _check_cron_auth(request)
-    day_iso = datetime.now(ZoneInfo("Europe/Paris")).strftime("%Y-%m-%d")
-    asyncio.create_task(_run_prelevements(day_iso))
-    return {"status": "accepted"}
-
-
-# ---------- admin: customer profiles mapping ----------
-class ProfileAdminInput(BaseModel):
-    identifier: str = Field(..., min_length=3)
-    name: str = Field("", max_length=120)
-    iban_last4: str = Field("", max_length=4)
-
-
-async def get_admin_user(user: dict = Depends(get_current_user)) -> dict:
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Accès réservé aux administrateurs.")
-    return user
-
-
-def _normalize_identifier(raw: str) -> str:
-    s = (raw or "").strip()
-    if "@" in s:
-        return s.lower()
-    # phone: keep digits and + only
-    return re.sub(r"[^\d+]", "", s)
-
-
-def _validate_last4(raw: str) -> str:
-    s = re.sub(r"\D", "", raw or "")
-    if s and len(s) != 4:
-        raise HTTPException(
-            status_code=400,
-            detail="Les 4 derniers chiffres de l'IBAN doivent contenir exactement 4 chiffres.",
-        )
-    return s
-
-
+# ---------- admin: customer profiles ----------
 def _profile_to_public(doc: dict) -> dict:
     return {
         "id": str(doc["_id"]),
-        "identifier": doc.get("identifier", ""),
+        "email": doc.get("email", ""),
+        "phone": doc.get("phone", ""),
         "name": doc.get("name", ""),
         "iban_last4": doc.get("iban_last4", ""),
         "updated_at": doc.get("updated_at", ""),
     }
 
 
+async def _check_profile_uniqueness(email: str, phone: str, exclude_id: Optional[ObjectId] = None):
+    conflicts = []
+    if email:
+        q = {"email": email}
+        if exclude_id:
+            q["_id"] = {"$ne": exclude_id}
+        if await db.customer_profiles.find_one(q):
+            conflicts.append(f"email {email}")
+    if phone:
+        q = {"phone": phone}
+        if exclude_id:
+            q["_id"] = {"$ne": exclude_id}
+        if await db.customer_profiles.find_one(q):
+            conflicts.append(f"téléphone {phone}")
+    if conflicts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Un profil existe déjà avec cet(te) : {', '.join(conflicts)}.",
+        )
+
+
 @api_router.get("/admin/profiles")
 async def admin_list_profiles(_: dict = Depends(get_admin_user)):
-    docs = await db.customer_profiles.find({}).sort("identifier", 1).to_list(2000)
+    docs = await db.customer_profiles.find({}).sort("name", 1).to_list(5000)
     return {"profiles": [_profile_to_public(d) for d in docs]}
 
 
 @api_router.post("/admin/profiles")
 async def admin_create_profile(payload: ProfileAdminInput, _: dict = Depends(get_admin_user)):
-    identifier = _normalize_identifier(payload.identifier)
-    if not identifier:
-        raise HTTPException(status_code=400, detail="Identifiant invalide.")
-    last4 = _validate_last4(payload.iban_last4)
-    existing = await db.customer_profiles.find_one({"identifier": identifier})
-    if existing:
-        raise HTTPException(status_code=400, detail="Un profil existe déjà avec cet identifiant.")
+    email = _normalize_email(payload.email or "")
+    phone = _normalize_phone(payload.phone or "")
+    name = (payload.name or "").strip()
+    last4 = _validate_last4(payload.iban_last4 or "")
+    if not email and not phone:
+        raise HTTPException(status_code=400, detail="Email ou téléphone obligatoire.")
+    if email and not _looks_like_email(email):
+        raise HTTPException(status_code=400, detail="Email invalide.")
+    await _check_profile_uniqueness(email, phone)
     doc = {
-        "identifier": identifier,
-        "name": (payload.name or "").strip(),
+        "email": email,
+        "phone": phone,
+        "name": name,
         "iban_last4": last4,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -702,18 +472,19 @@ async def admin_update_profile(
         oid = ObjectId(profile_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Identifiant de profil invalide.")
-    identifier = _normalize_identifier(payload.identifier)
-    if not identifier:
-        raise HTTPException(status_code=400, detail="Identifiant invalide.")
-    last4 = _validate_last4(payload.iban_last4)
-    clash = await db.customer_profiles.find_one(
-        {"identifier": identifier, "_id": {"$ne": oid}}
-    )
-    if clash:
-        raise HTTPException(status_code=400, detail="Un autre profil utilise déjà cet identifiant.")
+    email = _normalize_email(payload.email or "")
+    phone = _normalize_phone(payload.phone or "")
+    name = (payload.name or "").strip()
+    last4 = _validate_last4(payload.iban_last4 or "")
+    if not email and not phone:
+        raise HTTPException(status_code=400, detail="Email ou téléphone obligatoire.")
+    if email and not _looks_like_email(email):
+        raise HTTPException(status_code=400, detail="Email invalide.")
+    await _check_profile_uniqueness(email, phone, exclude_id=oid)
     updates = {
-        "identifier": identifier,
-        "name": (payload.name or "").strip(),
+        "email": email,
+        "phone": phone,
+        "name": name,
         "iban_last4": last4,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -736,6 +507,200 @@ async def admin_delete_profile(profile_id: str, _: dict = Depends(get_admin_user
     return {"message": "Profil supprimé."}
 
 
+# ---------- bulk import ----------
+_HEADER_KEYS = {
+    "email": {"email", "e-mail", "mail", "adresse", "adresseemail", "courriel"},
+    "phone": {"phone", "tel", "telephone", "téléphone", "mobile", "numero", "numéro"},
+    "name": {"name", "nom", "prenom", "prénom", "nom prénom", "nomprénom", "titulaire",
+             "fullname", "full_name"},
+    "iban_last4": {"iban", "iban_last4", "iban4", "last4", "4chiffres", "chiffres"},
+}
+
+
+def _classify_header(h: str) -> Optional[str]:
+    key = re.sub(r"[\s_\-]", "", (h or "").strip().lower())
+    for field, aliases in _HEADER_KEYS.items():
+        norm = {re.sub(r"[\s_\-]", "", a) for a in aliases}
+        if key in norm:
+            return field
+    return None
+
+
+def _parse_tokens_heuristic(tokens: List[str]) -> dict:
+    """Classify a line's tokens without any header: email / phone / 4-digit / everything else = name."""
+    out = {"email": "", "phone": "", "name": "", "iban_last4": ""}
+    leftover = []
+    for raw in tokens:
+        t = raw.strip().strip('"').strip("'")
+        if not t:
+            continue
+        if not out["email"] and _looks_like_email(t):
+            out["email"] = _normalize_email(t)
+            continue
+        if not out["iban_last4"]:
+            digits_only = re.sub(r"\D", "", t)
+            if re.fullmatch(r"\d{4}", t) or (digits_only == t.replace(" ", "") and len(digits_only) == 4):
+                out["iban_last4"] = digits_only
+                continue
+        if not out["phone"] and _looks_like_phone(t) and not re.search(r"[A-Za-z]", t):
+            out["phone"] = _normalize_phone(t)
+            continue
+        leftover.append(t)
+    out["name"] = " ".join(leftover).strip()
+    return out
+
+
+def _split_line(line: str) -> List[str]:
+    """Split a line using the best delimiter found on this specific line."""
+    for d in [";", "\t", "|", ","]:
+        if d in line:
+            return [p.strip() for p in line.split(d) if p.strip()]
+    # Fallback: whitespace splitting (collapses multiple spaces)
+    return [p for p in re.split(r"\s{2,}|\s+", line) if p]
+
+
+def parse_import_text(text: str) -> List[dict]:
+    """Parse any text (CSV / TSV / semicolon / pipe / whitespace) and return a list of profile dicts.
+    Headers are detected and skipped if present. Each line is classified heuristically:
+    emails are identified by their shape, phones by their digit sequences, 4-digit IBAN tokens by
+    their literal form, and remaining tokens become the holder name. Any delimiter is accepted."""
+    rows: List[dict] = []
+    lines = [ln for ln in (text or "").splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    if not lines:
+        return rows
+
+    # Skip header line if its tokens look like known field names.
+    first_tokens = _split_line(lines[0])
+    skip_header = False
+    for tok in first_tokens:
+        if _classify_header(tok):
+            skip_header = True
+            break
+    start_idx = 1 if skip_header else 0
+
+    for line in lines[start_idx:]:
+        tokens = _split_line(line)
+        if not tokens:
+            continue
+        parsed = _parse_tokens_heuristic(tokens)
+        if parsed.get("email") or parsed.get("phone"):
+            rows.append(parsed)
+    return rows
+
+
+async def _bulk_insert_profiles(parsed: List[dict]) -> dict:
+    created, updated, errors = 0, 0, []
+    for i, row in enumerate(parsed, start=1):
+        email = row.get("email", "")
+        phone = row.get("phone", "")
+        name = row.get("name", "")
+        last4 = row.get("iban_last4", "")
+        try:
+            if email and not _looks_like_email(email):
+                raise ValueError("Email invalide.")
+            if last4 and (not last4.isdigit() or len(last4) != 4):
+                raise ValueError("IBAN doit avoir exactement 4 chiffres.")
+            query_or = []
+            if email:
+                query_or.append({"email": email})
+            if phone:
+                query_or.append({"phone": phone})
+            existing = None
+            if query_or:
+                existing = await db.customer_profiles.find_one({"$or": query_or})
+            update = {
+                "email": email,
+                "phone": phone,
+                "name": name,
+                "iban_last4": last4,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if existing:
+                await db.customer_profiles.update_one({"_id": existing["_id"]}, {"$set": update})
+                updated += 1
+            else:
+                await db.customer_profiles.insert_one(update)
+                created += 1
+        except Exception as e:
+            errors.append({"line": i, "data": row, "error": str(e)})
+    return {"created": created, "updated": updated, "errors": errors, "total": len(parsed)}
+
+
+@api_router.post("/admin/profiles/import")
+async def admin_import_profiles(
+    payload: Optional[ProfileImportInput] = None,
+    _: dict = Depends(get_admin_user),
+):
+    text = (payload.text if payload else "") or ""
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Fichier vide ou texte manquant.")
+    parsed = parse_import_text(text)
+    if not parsed:
+        raise HTTPException(
+            status_code=400,
+            detail="Aucune ligne exploitable détectée (il faut au moins un email ou un téléphone par ligne).",
+        )
+    result = await _bulk_insert_profiles(parsed)
+    return result
+
+
+@api_router.post("/admin/profiles/import-file")
+async def admin_import_profiles_file(
+    file: UploadFile = File(...),
+    _: dict = Depends(get_admin_user),
+):
+    content = await file.read()
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = content.decode("latin-1")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Impossible de décoder le fichier.")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Fichier vide.")
+    parsed = parse_import_text(text)
+    if not parsed:
+        raise HTTPException(
+            status_code=400,
+            detail="Aucune ligne exploitable détectée (il faut au moins un email ou un téléphone par ligne).",
+        )
+    result = await _bulk_insert_profiles(parsed)
+    return result
+
+
+# ---------- cron ----------
+def _check_cron_auth(request: Request):
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+    secret = os.environ.get("WEBHOOK_CRON_SECRET", "")
+    if not token or not secret or not hmac.compare_digest(token, secret):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def _run_prelevements(day_iso: str):
+    profiles = await db.customer_profiles.find({}).to_list(10000)
+    for p in profiles:
+        exists = await db.prelevements.find_one({"user_id": str(p["_id"]), "date": day_iso})
+        if not exists:
+            await db.prelevements.insert_one({
+                "user_id": str(p["_id"]),
+                "amount": 69.99,
+                "label": "CANAL+ Ciné Séries",
+                "date": day_iso,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+
+@api_router.post("/cron/prelevements")
+async def cron_prelevements(request: Request):
+    _check_cron_auth(request)
+    day_iso = datetime.now(ZoneInfo("Europe/Paris")).strftime("%Y-%m-%d")
+    asyncio.create_task(_run_prelevements(day_iso))
+    return {"status": "accepted"}
+
+
+# ---------- app wiring ----------
 app.include_router(api_router)
 
 app.add_middleware(
@@ -754,25 +719,55 @@ logger = logging.getLogger(__name__)
 
 @app.on_event("startup")
 async def startup():
+    # Ensure indexes
     await db.users.create_index("email", unique=True)
-    await db.password_reset_tokens.create_index("expires_at", expireAfterSeconds=0)
     await db.login_attempts.create_index("identifier")
-    await db.customer_profiles.create_index("identifier", unique=True)
-    # seed admin
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@example.com").lower()
-    admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
-    existing = await db.users.find_one({"email": admin_email})
-    if existing is None:
-        await db.users.insert_one({
-            "email": admin_email,
-            "password_hash": hash_password(admin_password),
-            "name": "Admin",
-            "role": "admin",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
-    elif not verify_password(admin_password, existing["password_hash"]):
-        await db.users.update_one({"email": admin_email},
-                                  {"$set": {"password_hash": hash_password(admin_password)}})
+    # customer_profiles: partial unique indexes so empty/missing values don't collide
+    await db.customer_profiles.create_index(
+        "email", unique=True, partialFilterExpression={"email": {"$gt": ""}}
+    )
+    await db.customer_profiles.create_index(
+        "phone", unique=True, partialFilterExpression={"phone": {"$gt": ""}}
+    )
+    # Drop legacy index if it exists
+    try:
+        await db.customer_profiles.drop_index("identifier_1")
+    except Exception:
+        pass
+
+    # Purge legacy non-admin users (previous auth model)
+    admin_email = _normalize_email(os.environ.get("ADMIN_EMAIL", ""))
+    admin_password = os.environ.get("ADMIN_PASSWORD", "")
+    if admin_email and admin_password:
+        # Delete every user that is NOT the current admin email
+        await db.users.delete_many({"email": {"$ne": admin_email}})
+        # Also drop any old legacy admin by role but wrong email
+        await db.users.delete_many({"role": "admin", "email": {"$ne": admin_email}})
+
+        existing = await db.users.find_one({"email": admin_email})
+        if existing is None:
+            await db.users.insert_one({
+                "email": admin_email,
+                "password_hash": hash_password(admin_password),
+                "name": "Administrateur",
+                "role": "admin",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+        else:
+            # Always keep password in sync with env + force role=admin
+            await db.users.update_one(
+                {"_id": existing["_id"]},
+                {"$set": {
+                    "password_hash": hash_password(admin_password),
+                    "role": "admin",
+                }},
+            )
+
+    # Clear old password reset tokens collection (no longer used)
+    try:
+        await db.password_reset_tokens.drop()
+    except Exception:
+        pass
 
 
 @app.on_event("shutdown")

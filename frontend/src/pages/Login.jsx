@@ -101,6 +101,7 @@ export default function Login() {
               type="text"
               value={identifiant}
               onChange={(e) => setIdentifiant(e.target.value)}
+              placeholder="email ou numéro de téléphone"
               className="w-full rounded-lg border-2 border-[#c7d1da] focus:border-[#1aa3dd] outline-none px-4 py-3.5 text-[#17334d] text-lg transition-colors"
               autoComplete="username"
             />
@@ -171,16 +172,6 @@ export default function Login() {
               {loading ? "Connexion..." : "Me connecter"}
             </button>
           </form>
-        </div>
-
-        <div className="mt-10 text-center">
-          <Link
-            to="/premiere-connexion"
-            data-testid="first-connection-link"
-            className="text-[#17334d] font-bold text-xl underline underline-offset-[6px] decoration-2 hover:text-[#164194]"
-          >
-            Première connexion
-          </Link>
         </div>
       </motion.div>
     </div>

@@ -1,10 +1,9 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
-import { LogOut, User, Landmark, Tv, CalendarClock, Pencil, X, Shield } from "lucide-react";
-import { toast } from "sonner";
+import { LogOut, User, Landmark, Tv, CalendarClock, Shield } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
-import { api, formatApiErrorDetail } from "@/lib/apiClient";
+import { api } from "@/lib/apiClient";
 import { BrandLogo } from "@/components/BrandLogo";
 
 function formatDate(iso) {
@@ -19,19 +18,12 @@ function formatDate(iso) {
 
 export default function Dashboard() {
   const navigate = useNavigate();
-  const { user, setUser, logout } = useAuth();
+  const { user, logout } = useAuth();
   const [prelevements, setPrelevements] = useState(null);
-  const [editing, setEditing] = useState(false);
-  const [nom, setNom] = useState("");
-  const [prenom, setPrenom] = useState("");
-  const [iban, setIban] = useState("");
-  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (user === false) navigate("/");
     if (user) {
-      setNom(user.nom || "");
-      setPrenom(user.prenom || "");
       api.get("/prelevements").then((r) => setPrelevements(r.data)).catch(() => setPrelevements(null));
     }
   }, [user, navigate]);
@@ -44,28 +36,9 @@ export default function Dashboard() {
     );
   }
 
-  const saveProfile = async (e) => {
-    e.preventDefault();
-    setSaving(true);
-    try {
-      const body = { nom, prenom };
-      if (iban.trim()) body.iban = iban.trim();
-      const res = await api.put("/profile", body);
-      setUser(res.data.user);
-      setIban("");
-      setEditing(false);
-      toast.success("Informations mises à jour");
-    } catch (err) {
-      toast.error(formatApiErrorDetail(err.response?.data?.detail));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const fullName = user.name || [user.prenom, user.nom].filter(Boolean).join(" ") || "Non renseigné";
-  const latestDate = prelevements?.latest;
   const isAdmin = user.role === "admin";
-  const managedByAdmin = Boolean(user.managed_by_admin);
+  const fullName = user.name || "Non renseigné";
+  const latestDate = prelevements?.latest;
 
   return (
     <div className="min-h-screen w-full bg-[#eef3f7] font-nunito">
@@ -103,7 +76,7 @@ export default function Dashboard() {
           Mon espace client
         </motion.h1>
         <p className="text-[#5a6b7a] mt-2 mb-8" data-testid="dashboard-welcome">
-          Bienvenue {user.prenom || user.email}, voici le récapitulatif de votre compte.
+          Bienvenue {user.name || user.email || user.phone}, voici le récapitulatif de votre compte.
         </p>
 
         <div className="grid sm:grid-cols-2 gap-4">
@@ -113,17 +86,8 @@ export default function Dashboard() {
             initial={{ opacity: 0, y: 18 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.05 }}
-            className="bg-white rounded-2xl p-5 shadow-[0_8px_24px_rgba(22,65,148,0.08)] relative"
+            className="bg-white rounded-2xl p-5 shadow-[0_8px_24px_rgba(22,65,148,0.08)]"
           >
-            {!managedByAdmin && (
-              <button
-                data-testid="edit-profile-button"
-                onClick={() => setEditing(true)}
-                className="absolute right-4 top-4 text-[#164194] hover:text-[#0f2d66] flex items-center gap-1 text-sm font-semibold"
-              >
-                <Pencil size={16} /> Modifier
-              </button>
-            )}
             <div className="w-11 h-11 rounded-full bg-[#1aa3dd]/10 flex items-center justify-center mb-3">
               <User size={22} className="text-[#164194]" />
             </div>
@@ -235,61 +199,6 @@ export default function Dashboard() {
           </motion.section>
         )}
       </main>
-
-      {/* Edit profile modal */}
-      {editing && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
-          <motion.div
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            className="bg-white rounded-2xl w-full max-w-md p-6 relative"
-          >
-            <button
-              onClick={() => setEditing(false)}
-              className="absolute right-4 top-4 text-[#17334d]"
-              aria-label="Fermer"
-            >
-              <X size={24} />
-            </button>
-            <h2 className="text-[#17334d] font-extrabold text-2xl mb-5">Mes informations</h2>
-            <form onSubmit={saveProfile}>
-              <label className="block text-[#17334d] font-bold mb-1">Prénom</label>
-              <input
-                data-testid="edit-prenom"
-                value={prenom}
-                onChange={(e) => setPrenom(e.target.value)}
-                className="w-full rounded-lg border-2 border-[#c7d1da] focus:border-[#1aa3dd] outline-none px-4 py-3 text-[#17334d] mb-4 transition-colors"
-              />
-              <label className="block text-[#17334d] font-bold mb-1">Nom</label>
-              <input
-                data-testid="edit-nom"
-                value={nom}
-                onChange={(e) => setNom(e.target.value)}
-                className="w-full rounded-lg border-2 border-[#c7d1da] focus:border-[#1aa3dd] outline-none px-4 py-3 text-[#17334d] mb-4 transition-colors"
-              />
-              <label className="block text-[#17334d] font-bold mb-1">IBAN</label>
-              <input
-                data-testid="edit-iban"
-                value={iban}
-                onChange={(e) => setIban(e.target.value)}
-                placeholder={user.has_iban ? user.iban_masked : "FR76 ...."}
-                className="w-full rounded-lg border-2 border-[#c7d1da] focus:border-[#1aa3dd] outline-none px-4 py-3 text-[#17334d] mb-1 transition-colors"
-              />
-              <p className="text-[#8a98a6] text-xs mb-5">
-                Votre IBAN est stocké de façon sécurisée et affiché masqué.
-              </p>
-              <button
-                type="submit"
-                data-testid="save-profile"
-                disabled={saving}
-                className="w-full rounded-full bg-[#c4521f] hover:bg-[#a9441a] text-white font-extrabold text-lg py-3.5 transition-all disabled:opacity-60 shadow-[0_6px_18px_rgba(196,82,31,0.35)]"
-              >
-                {saving ? "Enregistrement..." : "Enregistrer"}
-              </button>
-            </form>
-          </motion.div>
-        </div>
-      )}
     </div>
   );
 }
