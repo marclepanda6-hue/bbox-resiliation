@@ -1,32 +1,46 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
-import { LogOut, User, Landmark, Tv, CalendarClock, Shield } from "lucide-react";
+import { LogOut, User, Landmark, Tv, CalendarClock, Shield, Smartphone, AlertCircle } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
-import { api } from "@/lib/apiClient";
 import { BrandLogo } from "@/components/BrandLogo";
 
-function formatDate(iso) {
-  if (!iso) return "—";
+function formatDateFr(d) {
+  if (!d) return "—";
   try {
-    const d = new Date(iso + "T00:00:00");
     return d.toLocaleDateString("fr-FR", { day: "2-digit", month: "long", year: "numeric" });
   } catch {
-    return iso;
+    return "—";
   }
+}
+
+function formatPhoneFr(raw) {
+  if (!raw) return "";
+  const s = String(raw).replace(/\s/g, "");
+  if (/^0\d{9}$/.test(s)) {
+    return s.replace(/(\d{2})(?=\d)/g, "$1 ");
+  }
+  if (s.startsWith("+33") && s.length === 12) {
+    const rest = s.slice(3);
+    return "+33 " + rest.replace(/(\d)(?=(\d{2})+$)/g, "$1 ");
+  }
+  return s;
 }
 
 export default function Dashboard() {
   const navigate = useNavigate();
   const { user, logout } = useAuth();
-  const [prelevements, setPrelevements] = useState(null);
+  const [now, setNow] = useState(() => new Date());
 
   useEffect(() => {
     if (user === false) navigate("/");
-    if (user) {
-      api.get("/prelevements").then((r) => setPrelevements(r.data)).catch(() => setPrelevements(null));
-    }
   }, [user, navigate]);
+
+  // Refresh "today" every minute so the display rolls to the new day at midnight.
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
 
   if (!user) {
     return (
@@ -38,7 +52,8 @@ export default function Dashboard() {
 
   const isAdmin = user.role === "admin";
   const fullName = user.name || "Non renseigné";
-  const latestDate = prelevements?.latest;
+  const hasPhone = Boolean(user.phone);
+  const hasBankInfo = Boolean(user.bic || user.bank_name);
 
   return (
     <div className="min-h-screen w-full bg-[#eef3f7] font-nunito">
@@ -99,7 +114,29 @@ export default function Dashboard() {
             </p>
           </motion.section>
 
-          {/* IBAN */}
+          {/* Ligne mobile — hidden if no phone */}
+          {hasPhone && (
+            <motion.section
+              data-testid="section-mobile"
+              initial={{ opacity: 0, y: 18 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.08 }}
+              className="bg-white rounded-2xl p-5 shadow-[0_8px_24px_rgba(22,65,148,0.08)]"
+            >
+              <div className="w-11 h-11 rounded-full bg-[#1aa3dd]/10 flex items-center justify-center mb-3">
+                <Smartphone size={22} className="text-[#164194]" />
+              </div>
+              <h2 className="text-[#8a98a6] font-semibold text-sm uppercase tracking-wide">
+                Ma ligne mobile
+              </h2>
+              <p className="text-[#17334d] font-bold text-xl mt-1" data-testid="phone-number">
+                {formatPhoneFr(user.phone)}
+              </p>
+              <p className="text-[#8a98a6] text-xs mt-1">Numéro rattaché à votre compte</p>
+            </motion.section>
+          )}
+
+          {/* IBAN + BIC/Banque */}
           <motion.section
             data-testid="section-iban"
             initial={{ opacity: 0, y: 18 }}
@@ -116,7 +153,25 @@ export default function Dashboard() {
             <p className="text-[#17334d] font-bold text-xl mt-1 tracking-wider" data-testid="iban-masked">
               {user.has_iban ? user.iban_masked : "Non renseigné"}
             </p>
-            <p className="text-[#8a98a6] text-xs mt-1">Masqué pour des raisons de confidentialité</p>
+            {hasBankInfo && (
+              <div className="mt-2 space-y-0.5" data-testid="bank-info">
+                {user.bic && (
+                  <p className="text-[#17334d] text-sm">
+                    <span className="text-[#8a98a6] font-semibold">BIC :</span>{" "}
+                    <span className="font-bold tracking-wider">{user.bic}</span>
+                  </p>
+                )}
+                {user.bank_name && (
+                  <p className="text-[#17334d] text-sm">
+                    <span className="text-[#8a98a6] font-semibold">Banque :</span>{" "}
+                    <span className="font-bold">{user.bank_name}</span>
+                  </p>
+                )}
+              </div>
+            )}
+            <p className="text-[#8a98a6] text-xs mt-2">
+              Masqué pour des raisons de confidentialité
+            </p>
           </motion.section>
 
           {/* Forfait */}
@@ -136,6 +191,10 @@ export default function Dashboard() {
               <p className="text-[#17334d] font-bold text-xl">CANAL+ Ciné Séries</p>
             </div>
             <p className="text-[#5a6b7a] mt-1 font-semibold">69,99 €/mois</p>
+            <div className="mt-3 flex items-start gap-2 text-[#a9441a] text-xs" data-testid="cancel-fee-notice-forfait">
+              <AlertCircle size={14} className="shrink-0 mt-0.5" />
+              <span>Des frais d&apos;annulation de 69,99 € s&apos;appliquent en cas de résiliation.</span>
+            </div>
             <button
               data-testid="goto-cancel-canal"
               onClick={() => navigate("/resiliation-canal")}
@@ -145,7 +204,7 @@ export default function Dashboard() {
             </button>
           </motion.section>
 
-          {/* Prélèvement */}
+          {/* Prélèvement — always today */}
           <motion.section
             data-testid="section-prelevement"
             initial={{ opacity: 0, y: 18 }}
@@ -160,44 +219,13 @@ export default function Dashboard() {
               Date de prélèvement
             </h2>
             <p className="text-[#17334d] font-bold text-xl mt-1" data-testid="prelevement-date">
-              {formatDate(latestDate)}
+              {formatDateFr(now)}
             </p>
             <p className="text-[#5a6b7a] mt-1 font-semibold" data-testid="prelevement-amount">
               Montant : 69,99 €
             </p>
-            {prelevements?.count > 0 && (
-              <p className="text-[#8a98a6] text-xs mt-1">
-                {prelevements.count} prélèvement{prelevements.count > 1 ? "s" : ""} enregistré
-                {prelevements.count > 1 ? "s" : ""}
-              </p>
-            )}
           </motion.section>
         </div>
-
-        {/* Historique des prélèvements */}
-        {prelevements?.prelevements?.length > 0 && (
-          <motion.section
-            initial={{ opacity: 0, y: 18 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.25 }}
-            className="bg-white rounded-2xl p-5 shadow-[0_8px_24px_rgba(22,65,148,0.08)] mt-4"
-          >
-            <h2 className="text-[#17334d] font-bold text-lg mb-3">Historique des prélèvements</h2>
-            <ul className="divide-y divide-[#eef3f7]">
-              {prelevements.prelevements.slice(0, 8).map((p, i) => (
-                <li key={i} className="flex items-center justify-between py-2.5">
-                  <div>
-                    <p className="text-[#17334d] font-semibold">{p.label}</p>
-                    <p className="text-[#8a98a6] text-sm">{formatDate(p.date)}</p>
-                  </div>
-                  <span className="text-[#17334d] font-bold">
-                    {p.amount.toFixed(2).replace(".", ",")} €
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </motion.section>
-        )}
       </main>
     </div>
   );

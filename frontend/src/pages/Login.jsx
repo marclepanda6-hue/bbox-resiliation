@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import { motion } from "framer-motion";
-import { Eye, EyeOff, X } from "lucide-react";
+import { Eye, EyeOff } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/context/AuthContext";
-import { formatApiErrorDetail } from "@/lib/apiClient";
+import { describeApiError } from "@/lib/apiClient";
 import { BrandLogo } from "@/components/BrandLogo";
 
 export default function Login() {
@@ -30,7 +30,7 @@ export default function Login() {
       toast.success(data.message || "Connexion réussie");
       navigate("/espace-client");
     } catch (err) {
-      const msg = formatApiErrorDetail(err.response?.data?.detail) || "Erreur de connexion";
+      const msg = describeApiError(err, "Erreur de connexion");
       setError(msg);
       toast.error(msg);
     } finally {
@@ -57,15 +57,7 @@ export default function Login() {
         transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
         className="relative w-full max-w-[440px] bg-white md:rounded-3xl md:shadow-[0_20px_60px_rgba(22,65,148,0.12)] px-6 pt-6 pb-12 md:px-10"
       >
-        {/* Close */}
-        <button
-          data-testid="close-button"
-          onClick={() => toast.info("Fenêtre fermée")}
-          className="absolute right-5 top-5 text-[#17334d] hover:text-[#164194] transition-colors"
-          aria-label="Fermer"
-        >
-          <X size={26} strokeWidth={2.5} />
-        </button>
+        {/* Close button hidden per product decision */}
 
         {/* Logo */}
         <motion.div

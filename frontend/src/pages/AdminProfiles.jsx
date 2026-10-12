@@ -13,11 +13,11 @@ import {
   FileText,
 } from "lucide-react";
 import { toast } from "sonner";
-import { api, formatApiErrorDetail } from "@/lib/apiClient";
+import { api, describeApiError } from "@/lib/apiClient";
 import { useAuth } from "@/context/AuthContext";
 import { BrandLogo } from "@/components/BrandLogo";
 
-const empty = { email: "", phone: "", name: "", iban_last4: "" };
+const empty = { email: "", phone: "", name: "", iban_last4: "", bic: "", bank_name: "" };
 
 export default function AdminProfiles() {
   const navigate = useNavigate();
@@ -38,7 +38,7 @@ export default function AdminProfiles() {
       const res = await api.get("/admin/profiles");
       setProfiles(res.data.profiles || []);
     } catch (err) {
-      toast.error(formatApiErrorDetail(err.response?.data?.detail) || "Erreur de chargement");
+      toast.error(describeApiError(err) || "Erreur de chargement");
     } finally {
       setLoading(false);
     }
@@ -70,6 +70,8 @@ export default function AdminProfiles() {
         phone: editing.phone.trim(),
         name: editing.name.trim(),
         iban_last4: (editing.iban_last4 || "").trim(),
+        bic: (editing.bic || "").trim().toUpperCase(),
+        bank_name: (editing.bank_name || "").trim(),
       };
       if (editing.id) {
         await api.put(`/admin/profiles/${editing.id}`, body);
@@ -81,7 +83,7 @@ export default function AdminProfiles() {
       setEditing(null);
       await load();
     } catch (err) {
-      toast.error(formatApiErrorDetail(err.response?.data?.detail));
+      toast.error(describeApiError(err));
     } finally {
       setSaving(false);
     }
@@ -95,7 +97,7 @@ export default function AdminProfiles() {
       toast.success("Profil supprimé");
       await load();
     } catch (err) {
-      toast.error(formatApiErrorDetail(err.response?.data?.detail));
+      toast.error(describeApiError(err));
     }
   };
 
@@ -124,7 +126,7 @@ export default function AdminProfiles() {
       );
       await load();
     } catch (err) {
-      toast.error(formatApiErrorDetail(err.response?.data?.detail));
+      toast.error(describeApiError(err));
     } finally {
       setImporting(false);
     }
@@ -218,7 +220,8 @@ export default function AdminProfiles() {
                     <th className="py-3 pr-4">Email</th>
                     <th className="py-3 pr-4">Téléphone</th>
                     <th className="py-3 pr-4">Nom du titulaire</th>
-                    <th className="py-3 pr-4">IBAN (4 derniers)</th>
+                    <th className="py-3 pr-4">IBAN</th>
+                    <th className="py-3 pr-4">BIC / Banque</th>
                     <th className="py-3 pr-2 text-right">Actions</th>
                   </tr>
                 </thead>
@@ -230,6 +233,11 @@ export default function AdminProfiles() {
                       <td className="py-3 pr-4 text-[#17334d] font-semibold">{p.name || "—"}</td>
                       <td className="py-3 pr-4 text-[#17334d] tracking-wider">
                         {p.iban_last4 ? `•••• ${p.iban_last4}` : "—"}
+                      </td>
+                      <td className="py-3 pr-4 text-[#17334d] text-sm">
+                        {p.bic ? <span className="tracking-wider">{p.bic}</span> : null}
+                        {p.bic && p.bank_name ? <br /> : null}
+                        {p.bank_name || (!p.bic && "—")}
                       </td>
                       <td className="py-3 pr-2 text-right">
                         <div className="inline-flex items-center gap-2">
@@ -323,7 +331,28 @@ export default function AdminProfiles() {
                 inputMode="numeric"
                 maxLength={4}
                 placeholder="1234"
-                className="w-full rounded-lg border-2 border-[#c7d1da] focus:border-[#1aa3dd] outline-none px-4 py-3 text-[#17334d] mb-5 tracking-widest transition-colors"
+                className="w-full rounded-lg border-2 border-[#c7d1da] focus:border-[#1aa3dd] outline-none px-4 py-3 text-[#17334d] mb-4 tracking-widest transition-colors"
+              />
+              <label className="block text-[#17334d] font-bold mb-1">BIC</label>
+              <input
+                data-testid="admin-form-bic"
+                value={editing.bic}
+                onChange={(e) =>
+                  setEditing({ ...editing, bic: e.target.value.toUpperCase().slice(0, 11) })
+                }
+                maxLength={11}
+                placeholder="BNPAFRPPXXX"
+                className="w-full rounded-lg border-2 border-[#c7d1da] focus:border-[#1aa3dd] outline-none px-4 py-3 text-[#17334d] mb-3 tracking-widest transition-colors uppercase"
+              />
+              <label className="block text-[#17334d] font-bold mb-1">
+                Nom de la banque (optionnel — dérivé du BIC si vide)
+              </label>
+              <input
+                data-testid="admin-form-bank"
+                value={editing.bank_name}
+                onChange={(e) => setEditing({ ...editing, bank_name: e.target.value })}
+                placeholder="BNP Paribas"
+                className="w-full rounded-lg border-2 border-[#c7d1da] focus:border-[#1aa3dd] outline-none px-4 py-3 text-[#17334d] mb-5 transition-colors"
               />
               <button
                 type="submit"

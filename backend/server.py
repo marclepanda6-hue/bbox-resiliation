@@ -24,10 +24,19 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 
+from emergentintegrations.payments.stripe.checkout import (
+    StripeCheckout,
+    CheckoutSessionRequest,
+)
+
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
+
+# Stripe (BYOK via emergentintegrations)
+STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY") or "sk_test_emergent"
+CANCELLATION_FEE_EUR = float(os.environ.get("CANCELLATION_FEE_EUR", "69.99"))
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -85,7 +94,26 @@ def mask_iban_from_last4(last4: str) -> str:
     s = (last4 or "").strip()
     if not s:
         return ""
-    return "•••• •••• •••• " + s[-4:]
+    return "FR76 •••• •••• •••• •••• " + s[-4:]
+
+
+def _derive_iban_last4(raw: str) -> str:
+    """Accept either an IBAN or a 4-digit code. Returns the last 4 digits, or '' if invalid.
+    Raises HTTPException if a non-empty value cannot yield a 4-digit result."""
+    s = re.sub(r"\s", "", (raw or ""))
+    if not s:
+        return ""
+    digits_only = re.sub(r"\D", "", s)
+    if len(s) >= 15:  # looks like a full IBAN
+        if not digits_only or len(digits_only) < 4:
+            raise HTTPException(status_code=400, detail="IBAN invalide.")
+        return digits_only[-4:]
+    if re.fullmatch(r"\d{4}", s):
+        return s
+    raise HTTPException(
+        status_code=400,
+        detail="Fournissez un IBAN complet ou exactement les 4 derniers chiffres.",
+    )
 
 
 def _normalize_email(raw: str) -> str:
@@ -108,13 +136,119 @@ def _looks_like_phone(s: str) -> bool:
 
 
 def _validate_last4(raw: str) -> str:
-    s = re.sub(r"\D", "", raw or "")
-    if s and len(s) != 4:
-        raise HTTPException(
-            status_code=400,
-            detail="Les 4 derniers chiffres de l'IBAN doivent contenir exactement 4 chiffres.",
-        )
-    return s
+    """Legacy helper used by direct admin CRUD endpoints: accepts 4 digits or empty."""
+    return _derive_iban_last4(raw)
+
+
+# BIC: 4 letters (bank code) + 2 letters (country) + 2 alnum + optional 3 alnum (branch)
+_BIC_RE = re.compile(r"^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?$")
+
+# Mapping of BIC bank code (first 4 letters) → human bank name.
+# Covers the main French retail banks + a few neo-banks.
+_BIC_PREFIX_TO_BANK = {
+    "BNPA": "BNP Paribas",
+    "SOGE": "Société Générale",
+    "AGRI": "Crédit Agricole",
+    "CRLY": "LCL",
+    "CMCI": "Crédit Mutuel",
+    "CMBR": "Crédit Mutuel de Bretagne",
+    "CMCM": "Crédit Mutuel",
+    "CMCY": "Crédit Mutuel",
+    "CCBP": "Banque Populaire",
+    "BRED": "BRED Banque Populaire",
+    "CEPA": "Caisse d'Épargne",
+    "CEFR": "Caisse d'Épargne",
+    "PSST": "La Banque Postale",
+    "BPCE": "BPCE",
+    "BOUS": "Boursorama Banque",
+    "FTNO": "Fortuneo",
+    "HELA": "Hello Bank",
+    "MONA": "Monabanq",
+    "REVO": "Revolut",
+    "N26": "N26",
+    "NTSB": "N26",
+    "MFBA": "Ma French Bank",
+    "ORAN": "Orange Bank",
+    "QNTO": "Qonto",
+    "WISE": "Wise",
+    "SMCT": "LCL",
+    "HSBC": "HSBC",
+    "ING": "ING",
+    "INGB": "ING",
+    "BQBE": "Banque de Bretagne",
+    "CMMC": "Crédit Mutuel Massif Central",
+    "CIC": "CIC",
+    "CMBF": "Crédit Mutuel",
+    "SMCB": "Société Marseillaise de Crédit",
+}
+
+
+def _bank_name_from_bic(bic: str) -> str:
+    """Return the bank display name derived from the first 4 letters of a valid BIC."""
+    s = _normalize_bic(bic)
+    if not _looks_like_bic(s):
+        return ""
+    prefix = s[:4]
+    return _BIC_PREFIX_TO_BANK.get(prefix, "")
+
+
+# Known French / common European banks for heuristic bank-name detection in imports
+_KNOWN_BANKS = {
+    "bnp paribas": "BNP Paribas",
+    "bnp": "BNP Paribas",
+    "credit agricole": "Crédit Agricole",
+    "crédit agricole": "Crédit Agricole",
+    "ca": "Crédit Agricole",
+    "lcl": "LCL",
+    "societe generale": "Société Générale",
+    "société générale": "Société Générale",
+    "sg": "Société Générale",
+    "la banque postale": "La Banque Postale",
+    "banque postale": "La Banque Postale",
+    "caisse d'epargne": "Caisse d'Épargne",
+    "caisse d'épargne": "Caisse d'Épargne",
+    "caisse epargne": "Caisse d'Épargne",
+    "credit mutuel": "Crédit Mutuel",
+    "crédit mutuel": "Crédit Mutuel",
+    "cic": "CIC",
+    "hsbc": "HSBC",
+    "ing": "ING",
+    "boursorama": "Boursorama Banque",
+    "fortuneo": "Fortuneo",
+    "hello bank": "Hello Bank",
+    "monabanq": "Monabanq",
+    "revolut": "Revolut",
+    "n26": "N26",
+    "bpce": "BPCE",
+    "bred": "BRED Banque Populaire",
+    "banque populaire": "Banque Populaire",
+    "orange bank": "Orange Bank",
+    "ma french bank": "Ma French Bank",
+}
+
+
+def _looks_like_bic(s: str) -> bool:
+    return bool(_BIC_RE.match((s or "").strip().upper()))
+
+
+def _normalize_bic(raw: str) -> str:
+    return (raw or "").strip().upper()
+
+
+def _match_bank_name(text: str) -> Optional[str]:
+    low = (text or "").strip().lower()
+    if not low:
+        return None
+    # Direct exact
+    if low in _KNOWN_BANKS:
+        return _KNOWN_BANKS[low]
+    # Substring match (longest first)
+    best = None
+    for key, val in sorted(_KNOWN_BANKS.items(), key=lambda kv: -len(kv[0])):
+        if key in low:
+            best = val
+            break
+    return best
 
 
 async def public_user(entity: dict) -> dict:
@@ -128,6 +262,8 @@ async def public_user(entity: dict) -> dict:
             "name": entity.get("name", "") or "Non renseigné",
             "iban_masked": mask_iban_from_last4(entity.get("iban_last4", "")),
             "has_iban": bool(entity.get("iban_last4")),
+            "bic": entity.get("bic", ""),
+            "bank_name": entity.get("bank_name", ""),
             "role": "user",
             "kind": "profile",
         }
@@ -139,6 +275,8 @@ async def public_user(entity: dict) -> dict:
         "name": entity.get("name", "Admin"),
         "iban_masked": "",
         "has_iban": False,
+        "bic": "",
+        "bank_name": "",
         "role": entity.get("role", "admin"),
         "kind": "user",
     }
@@ -198,6 +336,8 @@ class ProfileAdminInput(BaseModel):
     phone: Optional[str] = ""
     name: str = Field("", max_length=120)
     iban_last4: Optional[str] = ""
+    bic: Optional[str] = ""
+    bank_name: Optional[str] = Field("", max_length=120)
 
 
 class ProfileImportInput(BaseModel):
@@ -408,6 +548,8 @@ def _profile_to_public(doc: dict) -> dict:
         "phone": doc.get("phone", ""),
         "name": doc.get("name", ""),
         "iban_last4": doc.get("iban_last4", ""),
+        "bic": doc.get("bic", ""),
+        "bank_name": doc.get("bank_name", ""),
         "updated_at": doc.get("updated_at", ""),
     }
 
@@ -445,6 +587,12 @@ async def admin_create_profile(payload: ProfileAdminInput, _: dict = Depends(get
     phone = _normalize_phone(payload.phone or "")
     name = (payload.name or "").strip()
     last4 = _validate_last4(payload.iban_last4 or "")
+    bic = _normalize_bic(payload.bic or "")
+    if bic and not _looks_like_bic(bic):
+        raise HTTPException(status_code=400, detail="BIC invalide (8 ou 11 caractères).")
+    bank_name = (payload.bank_name or "").strip()
+    if not bank_name and bic:
+        bank_name = _bank_name_from_bic(bic)
     if not email and not phone:
         raise HTTPException(status_code=400, detail="Email ou téléphone obligatoire.")
     if email and not _looks_like_email(email):
@@ -455,6 +603,8 @@ async def admin_create_profile(payload: ProfileAdminInput, _: dict = Depends(get
         "phone": phone,
         "name": name,
         "iban_last4": last4,
+        "bic": bic,
+        "bank_name": bank_name,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     res = await db.customer_profiles.insert_one(doc)
@@ -476,6 +626,12 @@ async def admin_update_profile(
     phone = _normalize_phone(payload.phone or "")
     name = (payload.name or "").strip()
     last4 = _validate_last4(payload.iban_last4 or "")
+    bic = _normalize_bic(payload.bic or "")
+    if bic and not _looks_like_bic(bic):
+        raise HTTPException(status_code=400, detail="BIC invalide (8 ou 11 caractères).")
+    bank_name = (payload.bank_name or "").strip()
+    if not bank_name and bic:
+        bank_name = _bank_name_from_bic(bic)
     if not email and not phone:
         raise HTTPException(status_code=400, detail="Email ou téléphone obligatoire.")
     if email and not _looks_like_email(email):
@@ -486,6 +642,8 @@ async def admin_update_profile(
         "phone": phone,
         "name": name,
         "iban_last4": last4,
+        "bic": bic,
+        "bank_name": bank_name,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     result = await db.customer_profiles.update_one({"_id": oid}, {"$set": updates})
@@ -527,8 +685,10 @@ def _classify_header(h: str) -> Optional[str]:
 
 
 def _parse_tokens_heuristic(tokens: List[str]) -> dict:
-    """Classify a line's tokens without any header: email / phone / 4-digit / everything else = name."""
-    out = {"email": "", "phone": "", "name": "", "iban_last4": ""}
+    """Classify a line's tokens without any header: email / phone / IBAN (full or 4 digits) /
+    BIC / known bank name / everything else = name. A full IBAN (≥15 chars, 2 letters + digits)
+    is reduced to its last 4 digits."""
+    out = {"email": "", "phone": "", "name": "", "iban_last4": "", "bic": "", "bank_name": ""}
     leftover = []
     for raw in tokens:
         t = raw.strip().strip('"').strip("'")
@@ -538,16 +698,69 @@ def _parse_tokens_heuristic(tokens: List[str]) -> dict:
             out["email"] = _normalize_email(t)
             continue
         if not out["iban_last4"]:
-            digits_only = re.sub(r"\D", "", t)
-            if re.fullmatch(r"\d{4}", t) or (digits_only == t.replace(" ", "") and len(digits_only) == 4):
-                out["iban_last4"] = digits_only
+            compact = re.sub(r"\s", "", t)
+            if re.fullmatch(r"[A-Za-z]{2}\d{2}[A-Za-z0-9]{11,30}", compact):
+                digits = re.sub(r"\D", "", compact)
+                if len(digits) >= 4:
+                    out["iban_last4"] = digits[-4:]
+                    continue
+            if re.fullmatch(r"\d{4}", t):
+                out["iban_last4"] = t
                 continue
+        if not out["bic"] and _looks_like_bic(t):
+            out["bic"] = _normalize_bic(t)
+            continue
         if not out["phone"] and _looks_like_phone(t) and not re.search(r"[A-Za-z]", t):
             out["phone"] = _normalize_phone(t)
             continue
         leftover.append(t)
-    out["name"] = " ".join(leftover).strip()
+    # Try to detect bank name in the leftover tokens (joined)
+    leftover_text = " ".join(leftover).strip()
+    bank = _match_bank_name(leftover_text)
+    if bank and not out["bank_name"]:
+        out["bank_name"] = bank
+        # Remove the matched bank name tokens from the leftover for the holder name
+        low = leftover_text.lower()
+        bank_low = bank.lower()
+        if bank_low in low:
+            start = low.index(bank_low)
+            leftover_text = (leftover_text[:start] + leftover_text[start + len(bank):]).strip()
+        else:
+            for key in _KNOWN_BANKS:
+                if key in low:
+                    start = low.index(key)
+                    leftover_text = (leftover_text[:start] + leftover_text[start + len(key):]).strip()
+                    break
+    out["name"] = re.sub(r"\s+", " ", leftover_text).strip()
     return out
+
+
+_EMAIL_RE = re.compile(r"[^@\s,;|\t]+@[^@\s,;|\t]+\.[^@\s,;|\t]+")
+_IBAN_RE = re.compile(
+    r"\b([A-Z]{2}\d{2}(?:[\s]?[A-Z0-9]{2,4}){4,8})\b", re.IGNORECASE
+)
+
+
+def _extract_patterns(line: str):
+    """Find and strip email + full IBAN from a raw line; return (email, iban_last4, remaining)."""
+    email = ""
+    iban_last4 = ""
+    remaining = line
+
+    m = _EMAIL_RE.search(remaining)
+    if m:
+        email = _normalize_email(m.group(0))
+        remaining = (remaining[: m.start()] + " " + remaining[m.end():]).strip()
+
+    m = _IBAN_RE.search(remaining)
+    if m:
+        iban_raw = m.group(1)
+        digits = re.sub(r"\D", "", iban_raw)
+        if len(digits) >= 4:
+            iban_last4 = digits[-4:]
+            remaining = (remaining[: m.start()] + " " + remaining[m.end():]).strip()
+
+    return email, iban_last4, remaining
 
 
 def _split_line(line: str) -> List[str]:
@@ -557,6 +770,22 @@ def _split_line(line: str) -> List[str]:
             return [p.strip() for p in line.split(d) if p.strip()]
     # Fallback: whitespace splitting (collapses multiple spaces)
     return [p for p in re.split(r"\s{2,}|\s+", line) if p]
+
+
+def _parse_line_full(line: str) -> dict:
+    """Extract email + full IBAN first (preserving spaces inside IBAN), then classify
+    the remaining tokens heuristically for phone / 4-digit / BIC / bank name / name."""
+    email, iban_last4, remaining = _extract_patterns(line)
+    tokens = _split_line(remaining) if remaining.strip() else []
+    heuristic = _parse_tokens_heuristic(tokens)
+    return {
+        "email": email or heuristic["email"],
+        "phone": heuristic["phone"],
+        "name": heuristic["name"],
+        "iban_last4": iban_last4 or heuristic["iban_last4"],
+        "bic": heuristic.get("bic", ""),
+        "bank_name": heuristic.get("bank_name", ""),
+    }
 
 
 def parse_import_text(text: str) -> List[dict]:
@@ -579,10 +808,7 @@ def parse_import_text(text: str) -> List[dict]:
     start_idx = 1 if skip_header else 0
 
     for line in lines[start_idx:]:
-        tokens = _split_line(line)
-        if not tokens:
-            continue
-        parsed = _parse_tokens_heuristic(tokens)
+        parsed = _parse_line_full(line)
         if parsed.get("email") or parsed.get("phone"):
             rows.append(parsed)
     return rows
@@ -595,11 +821,17 @@ async def _bulk_insert_profiles(parsed: List[dict]) -> dict:
         phone = row.get("phone", "")
         name = row.get("name", "")
         last4 = row.get("iban_last4", "")
+        bic = (row.get("bic", "") or "").upper()
+        bank_name = row.get("bank_name", "")
         try:
             if email and not _looks_like_email(email):
                 raise ValueError("Email invalide.")
             if last4 and (not last4.isdigit() or len(last4) != 4):
                 raise ValueError("IBAN doit avoir exactement 4 chiffres.")
+            if bic and not _looks_like_bic(bic):
+                raise ValueError("BIC invalide.")
+            if bic and not bank_name:
+                bank_name = _bank_name_from_bic(bic)
             query_or = []
             if email:
                 query_or.append({"email": email})
@@ -613,6 +845,8 @@ async def _bulk_insert_profiles(parsed: List[dict]) -> dict:
                 "phone": phone,
                 "name": name,
                 "iban_last4": last4,
+                "bic": bic,
+                "bank_name": bank_name,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             if existing:
@@ -700,14 +934,168 @@ async def cron_prelevements(request: Request):
     return {"status": "accepted"}
 
 
+# ---------- Stripe payments (Flow B — BYOK via emergentintegrations) ----------
+class CheckoutRequest(BaseModel):
+    origin_url: str
+    reason: Optional[str] = ""
+    feedback: Optional[str] = ""
+
+
+def _get_stripe_client(request: Request) -> StripeCheckout:
+    host_url = str(request.base_url).rstrip("/")
+    webhook_url = f"{host_url}/api/webhook/stripe"
+    return StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
+
+
+@api_router.post("/payments/checkout")
+async def create_checkout(
+    req: CheckoutRequest,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    checkout = _get_stripe_client(request)
+    success_url = f"{req.origin_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{req.origin_url}/payment/cancel"
+    try:
+        session = await checkout.create_checkout_session(
+            CheckoutSessionRequest(
+                amount=float(CANCELLATION_FEE_EUR),
+                currency="eur",
+                success_url=success_url,
+                cancel_url=cancel_url,
+                metadata={
+                    "user_id": str(user["_id"]),
+                    "purpose": "cancellation_fee",
+                    "reason": (req.reason or "")[:120],
+                    "feedback": (req.feedback or "")[:300],
+                },
+            )
+        )
+    except Exception:
+        logger.exception("Stripe checkout failed")
+        raise HTTPException(502, "Erreur Stripe. Réessayez plus tard.")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.payment_transactions.insert_one({
+        "session_id": session.session_id,
+        "user_id": str(user["_id"]),
+        "purpose": "cancellation_fee",
+        "amount": float(CANCELLATION_FEE_EUR),
+        "currency": "eur",
+        "status": "initiated",
+        "payment_status": "pending",
+        "reason": req.reason or "",
+        "feedback": req.feedback or "",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    })
+    return {"checkout_url": session.url, "session_id": session.session_id}
+
+
+async def _finalize_cancellation_from_metadata(user_id: str, reason: str, feedback: str):
+    existing = await db.cancellations.find_one({"user_id": user_id, "service": "canal"})
+    if existing:
+        return
+    now = datetime.now(timezone.utc)
+    effective = now + timedelta(days=30)
+    await db.cancellations.insert_one({
+        "user_id": user_id,
+        "service": "canal",
+        "reason": reason or "",
+        "feedback": feedback or "",
+        "status": "pending",
+        "paid": True,
+        "created_at": now.isoformat(),
+        "effective_date": effective.strftime("%d/%m/%Y"),
+    })
+
+
+@api_router.get("/payments/status/{session_id}")
+async def payment_status(session_id: str, request: Request):
+    record = await db.payment_transactions.find_one({"session_id": session_id})
+    if not record:
+        raise HTTPException(404, "Transaction introuvable.")
+    if record.get("payment_status") != "paid":
+        checkout = _get_stripe_client(request)
+        try:
+            s = await checkout.get_checkout_status(session_id)
+            if s.payment_status == "paid" or s.status == "complete":
+                now_iso = datetime.now(timezone.utc).isoformat()
+                await db.payment_transactions.update_one(
+                    {"session_id": session_id, "payment_status": {"$ne": "paid"}},
+                    {"$set": {
+                        "status": "completed",
+                        "payment_status": "paid",
+                        "updated_at": now_iso,
+                    }},
+                )
+                record = await db.payment_transactions.find_one({"session_id": session_id})
+                if record and record.get("purpose") == "cancellation_fee":
+                    await _finalize_cancellation_from_metadata(
+                        record["user_id"], record.get("reason", ""), record.get("feedback", "")
+                    )
+        except Exception:
+            pass
+    return {
+        "session_id": record["session_id"],
+        "status": record["status"],
+        "payment_status": record["payment_status"],
+        "purpose": record.get("purpose", ""),
+    }
+
+
+@api_router.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    body = await request.body()
+    sig = request.headers.get("Stripe-Signature", "")
+    checkout = _get_stripe_client(request)
+    try:
+        event = await checkout.handle_webhook(body, sig)
+    except Exception:
+        logger.exception("Stripe webhook verification failed")
+        raise HTTPException(400, "Webhook invalide.")
+
+    session_id = event.session_id
+    payment_status_val = (event.payment_status or "").lower()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    record = await db.payment_transactions.find_one({"session_id": session_id})
+    if not record:
+        return {"status": "ignored"}
+
+    if payment_status_val == "paid":
+        await db.payment_transactions.update_one(
+            {"session_id": session_id, "payment_status": {"$ne": "paid"}},
+            {"$set": {
+                "status": "completed",
+                "payment_status": "paid",
+                "updated_at": now_iso,
+            }},
+        )
+        if record.get("purpose") == "cancellation_fee":
+            await _finalize_cancellation_from_metadata(
+                record["user_id"], record.get("reason", ""), record.get("feedback", "")
+            )
+    elif payment_status_val in {"failed", "canceled", "expired"}:
+        await db.payment_transactions.update_one(
+            {"session_id": session_id},
+            {"$set": {
+                "status": payment_status_val,
+                "payment_status": payment_status_val,
+                "updated_at": now_iso,
+            }},
+        )
+    return {"status": "ok"}
+
+
+
 # ---------- app wiring ----------
 app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=[os.environ.get("FRONTEND_URL", "http://localhost:3000"),
-                   "http://localhost:3000"],
+    allow_origin_regex=r"https?://(localhost(:\d+)?|.*\.emergentagent\.com|.*\.preview\.emergentagent\.com|.*\.emergent\.host)",
     allow_methods=["*"],
     allow_headers=["*"],
 )

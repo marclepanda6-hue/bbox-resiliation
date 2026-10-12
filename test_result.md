@@ -93,6 +93,51 @@ backend:
           agent: "testing"
           comment: "✅ PASSED (3/3 tests). All removed endpoints return 404 or 405: POST /api/auth/register, POST /api/auth/forgot-password, POST /api/auth/reset-password."
 
+  - task: "CORS: autoriser tous les sous-domaines emergentagent.com"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "allow_origin_regex matchant localhost(:port), *.emergentagent.com, *.preview.emergentagent.com, *.emergent.host. Fix pour le bug 'Une erreur est survenue' depuis les sous-domaines déployés."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED (26/26 tests). CORS preflight OPTIONS requests work correctly for all required origins: reset-abonnement.deployed.emergentagent.com, foo.preview.emergentagent.com, bar.emergent.host, localhost:3000, localhost:5173. All return correct headers: Access-Control-Allow-Origin (echoes origin), Access-Control-Allow-Credentials: true, Access-Control-Allow-Methods includes POST, Access-Control-Allow-Headers includes content-type. Evil origin (evil.example.com) correctly blocked."
+
+  - task: "Masquage IBAN format FR76 •••• •••• •••• •••• XXXX"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "mask_iban_from_last4 renvoie 'FR76 •••• •••• •••• •••• XXXX' (5 groupes de 4 bullets avant les 4 derniers chiffres). public_user() retourne iban_masked avec ce format."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED (5/5 tests). New IBAN mask format working correctly. Profile with iban_last4='4521' returns iban_masked='FR76 •••• •••• •••• •••• 4521' (exactly as specified). Empty iban_last4 returns empty string. Format verified via /api/auth/me endpoint."
+
+  - task: "Import accepte des IBAN complets"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "_derive_iban_last4 accepte maintenant un IBAN complet (>= 15 caractères) et extrait les 4 derniers chiffres. Testé avec FR76 3000 4000 0000 0000 4521 → 4521, FR7612345678901234567891234 → 1234, GB82 WEST 1234 5698 7654 32 → 5432."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED (6/6 tests). Import with full IBANs working correctly. Tested 3 profiles with full IBANs: FR76 3000 4000 0000 0000 4521 → iban_last4='4521', FR7612345678901234567891234 → iban_last4='1234', GB82 WEST 1234 5698 7654 32 → iban_last4='5432'. All profiles created successfully. Login and /api/auth/me return correct iban_masked with new FR76 format."
+
 frontend:
   - task: "Login: placeholder email/téléphone, suppression du lien 'Première connexion'"
     implemented: true
@@ -132,8 +177,8 @@ frontend:
 
 metadata:
   created_by: "main_agent"
-  version: "2.1"
-  test_sequence: 3
+  version: "3.0"
+  test_sequence: 5
   run_ui: false
 
 test_plan:
@@ -210,3 +255,87 @@ agent_communication:
         This is expected behavior - the system normalizes to digits only without the +33 prefix.
         
         All backend functionality is working correctly. Ready for production.
+
+    - agent: "main"
+      message: |
+        ITÉRATION #4 — bug "Une erreur est survenue" (connexion impossible depuis un sous-domaine
+        de deploy différent du FRONTEND_URL de .env) + IBAN complet dans l'import + nouveau masque.
+        
+        Changements à retester côté backend :
+        
+        1. CORS (backend/server.py)
+           - allow_origins fixe remplacé par allow_origin_regex matchant :
+             localhost(:port), *.emergentagent.com, *.preview.emergentagent.com, *.emergent.host.
+           - Vérifier qu'un preflight OPTIONS avec un header
+             Origin: "https://reset-abonnement.deployed.emergentagent.com"
+             renvoie 200 avec Access-Control-Allow-Credentials: true et le même Origin dans
+             Access-Control-Allow-Origin.
+        
+        2. Masquage IBAN (backend/server.py mask_iban_from_last4)
+           - Pour iban_last4="4521" la fonction doit renvoyer
+             "FR76 •••• •••• •••• •••• 4521" (5 groupes de 4 avant les 4 derniers chiffres).
+           - public_user() d'un profil avec iban_last4 non vide → user.iban_masked identique
+             à la chaîne ci-dessus.
+        
+        3. Import IBAN complet (backend/server.py /api/admin/profiles/import)
+           Tester que ces IBAN variés produisent iban_last4 correct :
+           - "FR76 3000 4000 0000 0000 4521" → 4521
+           - "FR7612345678901234567891234" (compact) → 1234
+           - "GB82 WEST 1234 5698 7654 32" (UK IBAN) → 5432
+           - mix avec email + phone + nom + IBAN complet sur la même ligne, dans n'importe quel
+             ordre.
+           - L'IBAN avec espaces internes ne doit PAS être cassé par le délimiteur de ligne.
+        
+        4. Non-régression :
+           - Admin login OK / wrong password 401.
+           - Login profile par email ou phone.
+           - CRUD admin profiles.
+           - Résiliation CANAL+ cancel/undo.
+           - Endpoints supprimés toujours 404.
+        
+        Credentials : /app/memory/test_credentials.md (dacostakanan@gmail.com / 24689100?C).
+
+    - agent: "testing"
+      message: |
+        ✅ ALL NEW FEATURES TESTED AND WORKING (44/44 tests)
+        
+        ITÉRATION #4 testing completed successfully:
+        
+        1. CORS Fix (26/26 tests) ✅ — PRIMARY FOCUS
+           - Preflight OPTIONS requests work for all required origins:
+             • https://reset-abonnement.deployed.emergentagent.com ✅
+             • https://foo.preview.emergentagent.com ✅
+             • https://bar.emergent.host ✅
+             • http://localhost:3000 ✅
+             • http://localhost:5173 ✅
+           - All return correct CORS headers:
+             • Access-Control-Allow-Origin: <origin> (echoes the request origin)
+             • Access-Control-Allow-Credentials: true
+             • Access-Control-Allow-Methods: includes POST
+             • Access-Control-Allow-Headers: includes content-type
+           - Evil origin (https://evil.example.com) correctly blocked ✅
+           - Bug "Une erreur est survenue" is FIXED — users can now login from any deployed subdomain
+        
+        2. New IBAN Mask Format (5/5 tests) ✅
+           - mask_iban_from_last4("4521") returns "FR76 •••• •••• •••• •••• 4521" ✅
+           - Format has exactly 5 groups of 4 bullets, then space and 4 digits
+           - Empty iban_last4 returns empty string ✅
+           - /api/auth/me returns correct iban_masked for profiles ✅
+        
+        3. Import Full IBAN (6/6 tests) ✅
+           - Import accepts full IBANs and extracts last 4 digits:
+             • "FR76 3000 4000 0000 0000 4521" → iban_last4="4521" ✅
+             • "FR7612345678901234567891234" (compact) → iban_last4="1234" ✅
+             • "GB82 WEST 1234 5698 7654 32" (UK IBAN) → iban_last4="5432" ✅
+           - IBANs with spaces handled correctly (not broken by delimiter) ✅
+           - Profiles created successfully and iban_masked uses new FR76 format ✅
+        
+        4. Regression Tests (7/7 tests) ✅
+           - Admin login with correct/wrong password: working ✅
+           - Profile login with email/phone: working ✅
+           - Unknown identifier rejection: working ✅
+           - Admin endpoints protection: working ✅
+           - Removed endpoints still 404/405: working ✅
+        
+        ALL BACKEND FEATURES WORKING CORRECTLY. NO ISSUES FOUND.
+        The CORS bug fix resolves the "Une erreur est survenue" error reported by the user.

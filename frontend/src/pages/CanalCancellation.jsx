@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
 import { ArrowLeft, ShieldCheck, CalendarClock, Tv, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
-import { api, formatApiErrorDetail } from "@/lib/apiClient";
+import { api, describeApiError } from "@/lib/apiClient";
 import { useAuth } from "@/context/AuthContext";
 import { BrandLogo } from "@/components/BrandLogo";
 
@@ -51,12 +51,18 @@ export default function CanalCancellation() {
     }
     setLoading(true);
     try {
-      const res = await api.post("/subscription/canal/cancel", { reason, feedback });
-      toast.success(res.data.message);
-      const updated = await api.get("/subscription/canal");
-      setSub(updated.data);
+      const res = await api.post("/payments/checkout", {
+        origin_url: window.location.origin,
+        reason,
+        feedback,
+      });
+      if (res.data && res.data.checkout_url) {
+        window.location.href = res.data.checkout_url;
+        return;
+      }
+      setError("Impossible de démarrer le paiement.");
     } catch (err) {
-      const msg = formatApiErrorDetail(err.response?.data?.detail);
+      const msg = describeApiError(err);
       setError(msg);
       toast.error(msg);
     } finally {
@@ -77,7 +83,7 @@ export default function CanalCancellation() {
       setFeedback("");
       setConfirmChecked(false);
     } catch (err) {
-      toast.error(formatApiErrorDetail(err.response?.data?.detail));
+      toast.error(describeApiError(err));
     } finally {
       setLoading(false);
     }
@@ -105,9 +111,26 @@ export default function CanalCancellation() {
           <h1 className="text-[#17334d] font-extrabold text-3xl md:text-4xl mb-2">
             Résilier mon abonnement
           </h1>
-          <p className="text-[#5a6b7a] mb-8">
+          <p className="text-[#5a6b7a] mb-5">
             Gérez la résiliation de votre option télévision.
           </p>
+
+          {/* Cancellation fee highlight banner */}
+          <div
+            data-testid="cancel-fee-banner"
+            className="bg-[#fdebd3] border-2 border-[#c4521f] rounded-2xl p-4 mb-6 flex items-start gap-3"
+          >
+            <AlertTriangle size={22} className="text-[#c4521f] shrink-0 mt-0.5" />
+            <div>
+              <p className="text-[#a9441a] font-extrabold text-lg leading-tight">
+                Frais d&apos;annulation à régulariser : 69,99 €
+              </p>
+              <p className="text-[#7a5420] text-sm mt-1">
+                Pour finaliser la résiliation, vous devez régler les frais d&apos;annulation
+                par carte bancaire. Le paiement sécurisé est traité par Stripe.
+              </p>
+            </div>
+          </div>
 
           {/* Subscription card */}
           <div
@@ -184,7 +207,7 @@ export default function CanalCancellation() {
                 <AlertTriangle size={20} className="text-[#a9441a] shrink-0 mt-0.5" />
                 <p className="text-[#7a5420] text-sm">
                   La résiliation prend effet à la fin de votre période d'engagement en
-                  cours, soit environ 30 jours après votre demande.
+                  cours, soit environ 30 jours après le règlement des frais d&apos;annulation.
                 </p>
               </div>
 
@@ -227,7 +250,8 @@ export default function CanalCancellation() {
                     className="w-6 h-6 mt-0.5 rounded border-2 border-[#c7d1da] accent-[#164194] cursor-pointer shrink-0"
                   />
                   <span className="text-[#17334d] text-base">
-                    Je confirme vouloir résilier mon abonnement CANAL+.
+                    Je confirme vouloir résilier mon abonnement CANAL+ et régler les
+                    frais d&apos;annulation de 69,99 €.
                   </span>
                 </label>
 
@@ -251,13 +275,13 @@ export default function CanalCancellation() {
                     disabled={loading}
                     className="flex-1 rounded-full bg-[#c4521f] hover:bg-[#a9441a] active:scale-[0.99] text-white font-extrabold text-lg py-3.5 transition-all disabled:opacity-60 shadow-[0_6px_18px_rgba(196,82,31,0.35)]"
                   >
-                    {loading ? "Traitement..." : "Confirmer la résiliation"}
+                    {loading ? "Redirection vers le paiement..." : "Confirmer la résiliation"}
                   </button>
                 </div>
               </form>
 
               <div className="flex items-center justify-center gap-2 mt-6 text-[#8a98a6] text-xs">
-                <ShieldCheck size={15} /> Demande sécurisée · sans frais cachés
+                <ShieldCheck size={15} /> Paiement sécurisé via Stripe · frais d&apos;annulation 69,99 €
               </div>
             </div>
           )}

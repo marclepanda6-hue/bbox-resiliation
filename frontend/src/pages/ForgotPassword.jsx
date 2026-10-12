@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { motion } from "framer-motion";
 import { ArrowLeft, MailCheck } from "lucide-react";
 import { toast } from "sonner";
-import { api, formatApiErrorDetail } from "@/lib/apiClient";
+import { api, describeApiError } from "@/lib/apiClient";
 import { BrandLogo } from "@/components/BrandLogo";
 
 export default function ForgotPassword() {
@@ -20,7 +20,7 @@ export default function ForgotPassword() {
       setSent(true);
       toast.success(res.data.message);
     } catch (err) {
-      toast.error(formatApiErrorDetail(err.response?.data?.detail));
+      toast.error(describeApiError(err));
     } finally {
       setLoading(false);
     }
