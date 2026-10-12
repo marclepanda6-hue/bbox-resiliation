@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
-import { LogOut, User, Landmark, Tv, CalendarClock, Pencil, X } from "lucide-react";
+import { LogOut, User, Landmark, Tv, CalendarClock, Pencil, X, Shield } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/context/AuthContext";
 import { api, formatApiErrorDetail } from "@/lib/apiClient";
@@ -62,23 +62,36 @@ export default function Dashboard() {
     }
   };
 
-  const fullName = [user.prenom, user.nom].filter(Boolean).join(" ") || "Non renseigné";
+  const fullName = user.name || [user.prenom, user.nom].filter(Boolean).join(" ") || "Non renseigné";
   const latestDate = prelevements?.latest;
+  const isAdmin = user.role === "admin";
+  const managedByAdmin = Boolean(user.managed_by_admin);
 
   return (
     <div className="min-h-screen w-full bg-[#eef3f7] font-nunito">
       <header className="bg-white shadow-sm px-5 py-3 flex items-center justify-between">
         <BrandLogo markSize={40} />
-        <button
-          data-testid="logout-button"
-          onClick={async () => {
-            await logout();
-            navigate("/");
-          }}
-          className="flex items-center gap-2 text-[#17334d] font-semibold hover:text-[#c4521f] transition-colors"
-        >
-          <LogOut size={20} /> Déconnexion
-        </button>
+        <div className="flex items-center gap-3">
+          {isAdmin && (
+            <button
+              data-testid="goto-admin"
+              onClick={() => navigate("/admin/profils")}
+              className="flex items-center gap-1.5 text-[#164194] font-semibold hover:text-[#0f2d66] transition-colors"
+            >
+              <Shield size={18} /> Admin
+            </button>
+          )}
+          <button
+            data-testid="logout-button"
+            onClick={async () => {
+              await logout();
+              navigate("/");
+            }}
+            className="flex items-center gap-2 text-[#17334d] font-semibold hover:text-[#c4521f] transition-colors"
+          >
+            <LogOut size={20} /> Déconnexion
+          </button>
+        </div>
       </header>
 
       <main className="max-w-3xl mx-auto px-5 py-8 md:py-12">
@@ -102,13 +115,15 @@ export default function Dashboard() {
             transition={{ delay: 0.05 }}
             className="bg-white rounded-2xl p-5 shadow-[0_8px_24px_rgba(22,65,148,0.08)] relative"
           >
-            <button
-              data-testid="edit-profile-button"
-              onClick={() => setEditing(true)}
-              className="absolute right-4 top-4 text-[#164194] hover:text-[#0f2d66] flex items-center gap-1 text-sm font-semibold"
-            >
-              <Pencil size={16} /> Modifier
-            </button>
+            {!managedByAdmin && (
+              <button
+                data-testid="edit-profile-button"
+                onClick={() => setEditing(true)}
+                className="absolute right-4 top-4 text-[#164194] hover:text-[#0f2d66] flex items-center gap-1 text-sm font-semibold"
+              >
+                <Pencil size={16} /> Modifier
+              </button>
+            )}
             <div className="w-11 h-11 rounded-full bg-[#1aa3dd]/10 flex items-center justify-center mb-3">
               <User size={22} className="text-[#164194]" />
             </div>
@@ -160,7 +175,7 @@ export default function Dashboard() {
             <button
               data-testid="goto-cancel-canal"
               onClick={() => navigate("/resiliation-canal")}
-              className="mt-3 text-[#c4521f] font-bold underline underline-offset-4 decoration-2 hover:text-[#a9441a]"
+              className="mt-4 w-full inline-flex items-center justify-center gap-2 rounded-full bg-[#c4521f] hover:bg-[#a9441a] active:scale-[0.99] text-white font-extrabold text-base py-3 px-4 transition-all shadow-[0_6px_18px_rgba(196,82,31,0.35)]"
             >
               Résilier mon abonnement
             </button>

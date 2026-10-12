@@ -31,3 +31,15 @@
 
 ## Prochaines tâches
 - Attendre la définition de la 2e page par l'utilisateur.
+
+## Mise à jour (2026-10)
+- Nouveau mapping admin "identifiant de connexion → nom + 4 derniers chiffres IBAN"
+  (collection Mongo `customer_profiles`).
+- Nouveau panel admin `/admin/profils` (visible uniquement pour role=admin) : CRUD complet
+  (créer, modifier, supprimer, rechercher).
+- `/api/auth/me` renvoie `name` et `iban_masked` surchargés depuis `customer_profiles`
+  lorsqu'une correspondance existe (via email ou téléphone normalisés).
+- Dashboard : bouton "Résilier mon abonnement" transformé en bouton plein orange bien visible ;
+  lien "Admin" dans l'en-tête pour les administrateurs.
+- Page de résiliation : suppression de la mention "Abonné depuis le 12 mars 2023".
+- Identifiants admin : voir `/app/memory/test_credentials.md`.

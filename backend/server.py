@@ -239,19 +239,6 @@ def set_auth_cookies(response: Response, access: str, refresh: str):
                         samesite="none", max_age=604800, path="/")
 
 
-def public_user(user: dict) -> dict:
-    return {
-        "id": str(user["_id"]),
-        "email": user["email"],
-        "name": user.get("name", ""),
-        "nom": user.get("nom", ""),
-        "prenom": user.get("prenom", ""),
-        "iban_masked": mask_iban(user.get("iban", "")),
-        "has_iban": bool(user.get("iban")),
-        "role": user.get("role", "user"),
-    }
-
-
 def mask_iban(iban: str) -> str:
     if not iban:
         return ""
@@ -259,6 +246,51 @@ def mask_iban(iban: str) -> str:
     if len(s) <= 4:
         return "•••• " + s
     return "•••• •••• •••• " + s[-4:]
+
+
+def mask_iban_from_last4(last4: str) -> str:
+    s = (last4 or "").strip()
+    if not s:
+        return ""
+    return "•••• •••• •••• " + s[-4:]
+
+
+async def public_user(user: dict) -> dict:
+    # Admin-managed overlay: lookup by email (lowercased); fall back to user record.
+    email = (user.get("email") or "").strip().lower()
+    profile = None
+    if email:
+        profile = await db.customer_profiles.find_one({"identifier": email})
+    # Also allow a phone-based identifier later if the user stored one.
+    phone = (user.get("phone") or "").strip()
+    if not profile and phone:
+        profile = await db.customer_profiles.find_one({"identifier": phone})
+
+    name_from_profile = (profile or {}).get("name", "").strip()
+    iban_last4 = ((profile or {}).get("iban_last4") or "").strip()
+
+    display_name = name_from_profile or (
+        " ".join([user.get("prenom", ""), user.get("nom", "")]).strip()
+        or user.get("name", "")
+    )
+    iban_masked = (
+        mask_iban_from_last4(iban_last4)
+        if iban_last4
+        else mask_iban(user.get("iban", ""))
+    )
+    has_iban = bool(iban_last4) or bool(user.get("iban"))
+
+    return {
+        "id": str(user["_id"]),
+        "email": user["email"],
+        "name": display_name,
+        "nom": user.get("nom", ""),
+        "prenom": user.get("prenom", ""),
+        "iban_masked": iban_masked,
+        "has_iban": has_iban,
+        "role": user.get("role", "user"),
+        "managed_by_admin": bool(profile),
+    }
 
 
 async def get_current_user(request: Request) -> dict:
@@ -373,7 +405,7 @@ async def register(payload: RegisterInput, response: Response):
             )
         except HTTPException as e:
             logger.warning(f"Welcome email not delivered: {e.detail}")
-    return {"message": "Compte créé avec succès", "user": public_user(doc)}
+    return {"message": "Compte créé avec succès", "user": await public_user(doc)}
 
 
 @api_router.post("/auth/login")
@@ -392,7 +424,7 @@ async def login(payload: LoginInput, request: Request, response: Response):
     access = create_access_token(str(user["_id"]), email)
     refresh = create_refresh_token(str(user["_id"]))
     set_auth_cookies(response, access, refresh)
-    return {"message": "Connexion réussie", "user": public_user(user)}
+    return {"message": "Connexion réussie", "user": await public_user(user)}
 
 
 @api_router.post("/auth/logout")
@@ -404,7 +436,7 @@ async def logout(response: Response, user: dict = Depends(get_current_user)):
 
 @api_router.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
-    return {"user": public_user(user)}
+    return {"user": await public_user(user)}
 
 
 @api_router.post("/auth/refresh")
@@ -547,7 +579,7 @@ async def update_profile(payload: ProfileInput, user: dict = Depends(get_current
     if updates:
         await db.users.update_one({"_id": user["_id"]}, {"$set": updates})
     u = await db.users.find_one({"_id": user["_id"]})
-    return {"user": public_user(u)}
+    return {"user": await public_user(u)}
 
 
 @api_router.get("/prelevements")
@@ -593,6 +625,117 @@ async def cron_prelevements(request: Request):
     return {"status": "accepted"}
 
 
+# ---------- admin: customer profiles mapping ----------
+class ProfileAdminInput(BaseModel):
+    identifier: str = Field(..., min_length=3)
+    name: str = Field("", max_length=120)
+    iban_last4: str = Field("", max_length=4)
+
+
+async def get_admin_user(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Accès réservé aux administrateurs.")
+    return user
+
+
+def _normalize_identifier(raw: str) -> str:
+    s = (raw or "").strip()
+    if "@" in s:
+        return s.lower()
+    # phone: keep digits and + only
+    return re.sub(r"[^\d+]", "", s)
+
+
+def _validate_last4(raw: str) -> str:
+    s = re.sub(r"\D", "", raw or "")
+    if s and len(s) != 4:
+        raise HTTPException(
+            status_code=400,
+            detail="Les 4 derniers chiffres de l'IBAN doivent contenir exactement 4 chiffres.",
+        )
+    return s
+
+
+def _profile_to_public(doc: dict) -> dict:
+    return {
+        "id": str(doc["_id"]),
+        "identifier": doc.get("identifier", ""),
+        "name": doc.get("name", ""),
+        "iban_last4": doc.get("iban_last4", ""),
+        "updated_at": doc.get("updated_at", ""),
+    }
+
+
+@api_router.get("/admin/profiles")
+async def admin_list_profiles(_: dict = Depends(get_admin_user)):
+    docs = await db.customer_profiles.find({}).sort("identifier", 1).to_list(2000)
+    return {"profiles": [_profile_to_public(d) for d in docs]}
+
+
+@api_router.post("/admin/profiles")
+async def admin_create_profile(payload: ProfileAdminInput, _: dict = Depends(get_admin_user)):
+    identifier = _normalize_identifier(payload.identifier)
+    if not identifier:
+        raise HTTPException(status_code=400, detail="Identifiant invalide.")
+    last4 = _validate_last4(payload.iban_last4)
+    existing = await db.customer_profiles.find_one({"identifier": identifier})
+    if existing:
+        raise HTTPException(status_code=400, detail="Un profil existe déjà avec cet identifiant.")
+    doc = {
+        "identifier": identifier,
+        "name": (payload.name or "").strip(),
+        "iban_last4": last4,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    res = await db.customer_profiles.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    return {"profile": _profile_to_public(doc)}
+
+
+@api_router.put("/admin/profiles/{profile_id}")
+async def admin_update_profile(
+    profile_id: str,
+    payload: ProfileAdminInput,
+    _: dict = Depends(get_admin_user),
+):
+    try:
+        oid = ObjectId(profile_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Identifiant de profil invalide.")
+    identifier = _normalize_identifier(payload.identifier)
+    if not identifier:
+        raise HTTPException(status_code=400, detail="Identifiant invalide.")
+    last4 = _validate_last4(payload.iban_last4)
+    clash = await db.customer_profiles.find_one(
+        {"identifier": identifier, "_id": {"$ne": oid}}
+    )
+    if clash:
+        raise HTTPException(status_code=400, detail="Un autre profil utilise déjà cet identifiant.")
+    updates = {
+        "identifier": identifier,
+        "name": (payload.name or "").strip(),
+        "iban_last4": last4,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    result = await db.customer_profiles.update_one({"_id": oid}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Profil introuvable.")
+    doc = await db.customer_profiles.find_one({"_id": oid})
+    return {"profile": _profile_to_public(doc)}
+
+
+@api_router.delete("/admin/profiles/{profile_id}")
+async def admin_delete_profile(profile_id: str, _: dict = Depends(get_admin_user)):
+    try:
+        oid = ObjectId(profile_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Identifiant de profil invalide.")
+    result = await db.customer_profiles.delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Profil introuvable.")
+    return {"message": "Profil supprimé."}
+
+
 app.include_router(api_router)
 
 app.add_middleware(
@@ -614,6 +757,7 @@ async def startup():
     await db.users.create_index("email", unique=True)
     await db.password_reset_tokens.create_index("expires_at", expireAfterSeconds=0)
     await db.login_attempts.create_index("identifier")
+    await db.customer_profiles.create_index("identifier", unique=True)
     # seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@example.com").lower()
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")

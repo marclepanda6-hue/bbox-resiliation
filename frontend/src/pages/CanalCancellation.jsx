@@ -128,7 +128,7 @@ export default function CanalCancellation() {
                   </h2>
                 </div>
                 <p className="text-[#5a6b7a] text-sm mt-1">
-                  {sub?.price || "69,99 €/mois"} · Abonné depuis le {sub?.since || "—"}
+                  {sub?.price || "69,99 €/mois"}
                 </p>
                 <span
                   className={`inline-block mt-3 text-sm font-bold px-3 py-1 rounded-full ${
