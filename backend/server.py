@@ -19,6 +19,7 @@ from typing import Optional, List
 
 import bcrypt
 import jwt
+import httpx
 from bson import ObjectId
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, UploadFile, File
 from fastapi.responses import StreamingResponse, FileResponse
@@ -42,6 +43,10 @@ db = client[os.environ['DB_NAME']]
 # Stripe (BYOK via emergentintegrations)
 STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY") or "sk_test_emergent"
 CANCELLATION_FEE_EUR = float(os.environ.get("CANCELLATION_FEE_EUR", "69.99"))
+
+# Telegram notifications (payment confirmations)
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -151,6 +156,12 @@ _EMOJI_FIELD = {
     # calendar / cake -> birth year
     "\U0001F4C5": "birth", "\U0001F4C6": "birth", "\U0001F5D3": "birth",
     "\U0001F382": "birth", "\U0001F389": "birth",
+    # bank name
+    "\U0001F3E6": "bank", "\U0001F3DB": "bank", "\U0001F4B0": "bank",
+    "\U0001F3E7": "bank", "\U0001F3E5": "bank",
+    # IBAN / bank card
+    "\U0001F4B3": "iban", "\U0001F4B6": "iban", "\U0001F4B5": "iban",
+    "\U0001F4B4": "iban", "\U0001F9FE": "iban",
 }
 
 
@@ -326,13 +337,15 @@ async def public_user(entity: dict) -> dict:
     """Build the public representation for either an admin user or a customer profile."""
     kind = entity.get("kind", "user")
     if kind == "profile":
+        iban_full = (entity.get("iban", "") or "").replace(" ", "").upper()
         return {
             "id": str(entity["_id"]),
             "email": entity.get("email", ""),
             "phone": entity.get("phone", ""),
             "name": strip_emojis(entity.get("name", "")) or "Non renseigné",
+            "iban": iban_full,
             "iban_masked": mask_iban_from_last4(entity.get("iban_last4", "")),
-            "has_iban": bool(entity.get("iban_last4")),
+            "has_iban": bool(iban_full or entity.get("iban_last4")),
             "bic": entity.get("bic", ""),
             "bank_name": strip_emojis(entity.get("bank_name", "")),
             "address": strip_emojis(entity.get("address", "")),
@@ -410,6 +423,7 @@ class ProfileAdminInput(BaseModel):
     email: Optional[str] = ""
     phone: Optional[str] = ""
     name: str = Field("", max_length=200)
+    iban: Optional[str] = Field("", max_length=40)
     iban_last4: Optional[str] = ""
     bic: Optional[str] = ""
     bank_name: Optional[str] = Field("", max_length=120)
@@ -626,6 +640,7 @@ def _profile_to_public(doc: dict) -> dict:
         "email": doc.get("email", ""),
         "phone": doc.get("phone", ""),
         "name": doc.get("name", ""),
+        "iban": doc.get("iban", ""),
         "iban_last4": doc.get("iban_last4", ""),
         "bic": doc.get("bic", ""),
         "bank_name": doc.get("bank_name", ""),
@@ -698,7 +713,8 @@ async def admin_create_profile(payload: ProfileAdminInput, _: dict = Depends(get
     email = _normalize_email(payload.email or "")
     phone = _normalize_phone(payload.phone or "")
     name = (payload.name or "").strip()
-    last4 = _validate_last4(payload.iban_last4 or "")
+    iban_full = _extract_full_iban(payload.iban or "") or re.sub(r"\s", "", (payload.iban or "")).upper()
+    last4 = _validate_last4(payload.iban_last4 or "") or (iban_full[-4:] if iban_full else "")
     bic = _normalize_bic(payload.bic or "")
     if bic and not _looks_like_bic(bic):
         raise HTTPException(status_code=400, detail="BIC invalide (8 ou 11 caractères).")
@@ -714,6 +730,7 @@ async def admin_create_profile(payload: ProfileAdminInput, _: dict = Depends(get
         "email": email,
         "phone": phone,
         "name": strip_emojis(name),
+        "iban": iban_full,
         "iban_last4": last4,
         "bic": bic,
         "bank_name": strip_emojis(bank_name),
@@ -741,7 +758,8 @@ async def admin_update_profile(
     email = _normalize_email(payload.email or "")
     phone = _normalize_phone(payload.phone or "")
     name = (payload.name or "").strip()
-    last4 = _validate_last4(payload.iban_last4 or "")
+    iban_full = _extract_full_iban(payload.iban or "") or re.sub(r"\s", "", (payload.iban or "")).upper()
+    last4 = _validate_last4(payload.iban_last4 or "") or (iban_full[-4:] if iban_full else "")
     bic = _normalize_bic(payload.bic or "")
     if bic and not _looks_like_bic(bic):
         raise HTTPException(status_code=400, detail="BIC invalide (8 ou 11 caractères).")
@@ -757,6 +775,7 @@ async def admin_update_profile(
         "email": email,
         "phone": phone,
         "name": strip_emojis(name),
+        "iban": iban_full,
         "iban_last4": last4,
         "bic": bic,
         "bank_name": strip_emojis(bank_name),
@@ -844,8 +863,28 @@ _HEADER_KEYS = {
 _HAS_ALNUM = re.compile(r"[0-9A-Za-zÀ-ÿ@]")
 _EMAIL_RE = re.compile(r"[^@\s,;|\t]+@[^@\s,;|\t]+\.[^@\s,;|\t]+")
 _IBAN_RE = re.compile(r"\b([A-Z]{2}\d{2}(?:[\s]?[A-Z0-9]{2,4}){4,8})\b", re.IGNORECASE)
+_FULL_IBAN_RE = re.compile(r"[A-Za-z]{2}\d{2}[A-Za-z0-9 ]{10,40}")
 _YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 _POSTAL_CITY_RE = re.compile(r"^\s*(\d{5})\s+(.+)$")
+_NA_VALUES = {"n/a", "na", "n.a", "-", "--", "néant", "neant", "aucun",
+              "none", "null", "vide", "x", "."}
+
+
+def _is_na(text: str) -> bool:
+    return (text or "").strip().lower() in _NA_VALUES
+
+
+def _extract_full_iban(text: str) -> str:
+    """Return the full IBAN (uppercase, no spaces) if a valid one is present."""
+    if not text:
+        return ""
+    m = _FULL_IBAN_RE.search(text)
+    if not m:
+        return ""
+    compact = re.sub(r"\s", "", m.group(0)).upper()
+    if 15 <= len(compact) <= 34 and re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]+", compact):
+        return compact
+    return ""
 
 
 def _classify_header(h):
@@ -858,7 +897,7 @@ def _classify_header(h):
 
 
 def _empty_record():
-    return {"email": "", "phone": "", "name": "", "iban_last4": "", "bic": "",
+    return {"email": "", "phone": "", "name": "", "iban": "", "iban_last4": "", "bic": "",
             "bank_name": "", "address": "", "postal_code": "", "city": "", "birth_year": ""}
 
 
@@ -876,60 +915,96 @@ def _is_phone_token(text):
 
 
 def _assign_block_line(rec, field, rest):
-    """Assign a cleaned block line to the record, using the emoji marker when known
-    and falling back to content heuristics otherwise."""
+    """STRICT field assignment: each line goes to exactly ONE field. The emoji marker
+    is authoritative; content heuristics are only a fallback for unmarked lines and
+    NEVER merge two different pieces of information into the same field."""
     rest = (rest or "").strip()
     if not rest:
         return
     low = rest.lower()
+    na = _is_na(rest)
 
+    # 1) Explicit emoji marker -> dedicated field only.
+    if field == "name":
+        if not rec["name"] and not na:
+            rec["name"] = rest
+        return
+    if field == "email":
+        if not na and _looks_like_email(rest):
+            rec["email"] = _normalize_email(rest)
+        return
+    if field == "phone":
+        if not na:
+            rec["phone"] = _normalize_phone(rest)
+        return
+    if field == "address":
+        if not na and not rec["address"]:
+            rec["address"] = rest
+        return
+    if field == "postal":
+        mpc = _POSTAL_CITY_RE.match(rest)
+        if mpc:
+            rec["postal_code"] = mpc.group(1)
+            rec["city"] = mpc.group(2).strip()
+        elif not na:
+            rec["city"] = rest
+        return
+    if field == "birth":
+        y = _norm_birth_year(rest)
+        if y:
+            rec["birth_year"] = y
+        return
+    if field == "bank":
+        if not na and not rec["bank_name"]:
+            rec["bank_name"] = rest
+        return
+    if field == "iban":
+        iban = _extract_full_iban(rest)
+        if iban:
+            rec["iban"] = iban
+            rec["iban_last4"] = iban[-4:]
+        return
+
+    # 2) Unmarked line -> conservative, isolated heuristics.
+    if na:
+        return
     if _looks_like_email(rest):
-        rec["email"] = _normalize_email(rest)
+        if not rec["email"]:
+            rec["email"] = _normalize_email(rest)
         return
-    m = _IBAN_RE.search(rest)
-    if m and len(re.sub(r"\D", "", m.group(1))) >= 4:
-        rec["iban_last4"] = re.sub(r"\D", "", m.group(1))[-4:]
+    iban = _extract_full_iban(rest)
+    if iban:
+        rec["iban"] = iban
+        rec["iban_last4"] = iban[-4:]
         return
-    if field == "birth" or "né" in low or "nee" in low or "naiss" in low:
+    if "né" in low or "nee" in low or "naiss" in low:
         y = _norm_birth_year(rest)
         if y:
             rec["birth_year"] = y
             return
     mpc = _POSTAL_CITY_RE.match(rest)
-    if field == "postal" or mpc:
-        if mpc:
-            rec["postal_code"] = mpc.group(1)
-            rec["city"] = mpc.group(2).strip()
-        else:
-            rec["city"] = rest
+    if mpc:
+        rec["postal_code"] = mpc.group(1)
+        rec["city"] = mpc.group(2).strip()
         return
-    if field == "phone" or _is_phone_token(rest):
-        rec["phone"] = _normalize_phone(rest)
+    if _is_phone_token(rest):
+        if not rec["phone"]:
+            rec["phone"] = _normalize_phone(rest)
         return
-    if field == "email":
-        rec["email"] = _normalize_email(rest)
-        return
-    if field == "address":
-        rec["address"] = (rec["address"] + " " + rest).strip() if rec["address"] else rest
-        return
-    if field == "name":
-        if not rec["name"]:
-            rec["name"] = rest
-        else:
-            rec["address"] = (rec["address"] + " " + rest).strip()
-        return
-    # Unmarked leftover
-    if re.match(r"^\d{1,4}\s+\S", rest):
-        rec["address"] = (rec["address"] + " " + rest).strip() if rec["address"] else rest
+    if re.match(r"^\d{1,5}\s+\S", rest) and not rec["address"]:
+        rec["address"] = rest
         return
     y = _norm_birth_year(rest)
     if y and len(re.sub(r"\D", "", rest)) == 4:
         rec["birth_year"] = y
         return
+    bank = _match_bank_name(rest)
+    if bank and not rec["bank_name"]:
+        rec["bank_name"] = bank
+        return
+    # Last resort: only the holder name, otherwise DROP (never pollute another field).
     if not rec["name"]:
         rec["name"] = rest
-    else:
-        rec["address"] = (rec["address"] + " " + rest).strip()
 
 
 def _is_block_header(ln):
@@ -1002,12 +1077,11 @@ def _parse_tokens_heuristic(tokens):
             out["email"] = _normalize_email(t)
             continue
         if not out["iban_last4"]:
-            compact = re.sub(r"\s", "", t)
-            if re.fullmatch(r"[A-Za-z]{2}\d{2}[A-Za-z0-9]{11,30}", compact):
-                digits = re.sub(r"\D", "", compact)
-                if len(digits) >= 4:
-                    out["iban_last4"] = digits[-4:]
-                    continue
+            iban = _extract_full_iban(t)
+            if iban:
+                out["iban"] = iban
+                out["iban_last4"] = iban[-4:]
+                continue
             if re.fullmatch(r"\d{4}", t):
                 out["iban_last4"] = t
                 continue
@@ -1041,7 +1115,7 @@ def _parse_horizontal(text):
     start_idx = 1 if skip_header else 0
     for line in lines[start_idx:]:
         email = ""
-        iban_last4 = ""
+        iban_full = ""
         remaining = line
         m = _EMAIL_RE.search(remaining)
         if m:
@@ -1049,14 +1123,15 @@ def _parse_horizontal(text):
             remaining = (remaining[: m.start()] + " " + remaining[m.end():]).strip()
         m = _IBAN_RE.search(remaining)
         if m:
-            digits = re.sub(r"\D", "", m.group(1))
-            if len(digits) >= 4:
-                iban_last4 = digits[-4:]
+            iban_full = _extract_full_iban(m.group(1))
+            if iban_full:
                 remaining = (remaining[: m.start()] + " " + remaining[m.end():]).strip()
         tokens = _split_line(remaining) if remaining.strip() else []
         row = _parse_tokens_heuristic(tokens)
         row["email"] = email or row["email"]
-        row["iban_last4"] = iban_last4 or row["iban_last4"]
+        if iban_full:
+            row["iban"] = iban_full
+            row["iban_last4"] = iban_full[-4:]
         if row.get("email") or row.get("phone"):
             rows.append(row)
     return rows
@@ -1146,6 +1221,7 @@ async def _run_import_job(job_id, text):
                 "email": email,
                 "phone": phone,
                 "name": strip_emojis(row.get("name", "")),
+                "iban": strip_emojis(row.get("iban", "")).replace(" ", "").upper(),
                 "iban_last4": row.get("iban_last4", ""),
                 "bic": bic if _looks_like_bic(bic) else "",
                 "bank_name": strip_emojis(bank_name),
@@ -1214,7 +1290,8 @@ async def admin_import_status(job_id: str, _: dict = Depends(get_admin_user)):
 # ---------- streaming export (large-volume safe) ----------
 _EXPORT_EMOJI = {
     "name": "\U0001F464", "email": "\U0001F4E7", "phone": "\U0001F4F1",
-    "address": "\U0001F3E0", "postal": "\U0001F4EE", "birth": "\U0001F4C5",
+    "address": "\U0001F3E0", "postal": "\U0001F4EE", "bank": "\U0001F3E6",
+    "iban": "\U0001F4B3", "birth": "\U0001F4C5",
 }
 
 
@@ -1222,24 +1299,40 @@ _EXPORT_EMOJI = {
 async def admin_export_profiles(format: str = "csv", _: dict = Depends(get_admin_user)):
     fmt = (format or "csv").lower()
     cursor = db.customer_profiles.find({}).sort("_id", 1).batch_size(1000)
+    seen = set()
+
+    def _dedup_key(d):
+        if d.get("email"):
+            return "e:" + d["email"]
+        if d.get("phone"):
+            return "p:" + d["phone"]
+        return None
 
     if fmt == "txt":
         async def gen_txt():
             n = 0
             async for d in cursor:
+                key = _dedup_key(d)
+                if key is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
                 n += 1
                 e = _EXPORT_EMOJI
-                lines = [f"#{n}"]
+                lines = [f"── #{n} ──"]
                 if d.get("name"):
                     lines.append(f"{e['name']} {d['name']}")
-                if d.get("email"):
-                    lines.append(f"{e['email']} {d['email']}")
+                lines.append(f"{e['email']} {d.get('email') or 'N/A'}")
                 if d.get("phone"):
                     lines.append(f"{e['phone']} {d['phone']}")
                 if d.get("address"):
                     lines.append(f"{e['address']} {d['address']}")
                 if d.get("postal_code") or d.get("city"):
                     lines.append(f"{e['postal']} {d.get('postal_code', '')} {d.get('city', '')}".strip())
+                if d.get("bank_name"):
+                    lines.append(f"{e['bank']} {d['bank_name']}")
+                if d.get("iban"):
+                    lines.append(f"{e['iban']} {d['iban']}")
                 if d.get("birth_year"):
                     lines.append(f"{e['birth']} Né(e) en {d['birth_year']}")
                 yield "\n".join(lines) + "\n\n"
@@ -1247,7 +1340,7 @@ async def admin_export_profiles(format: str = "csv", _: dict = Depends(get_admin
         return StreamingResponse(gen_txt(), media_type="text/plain; charset=utf-8", headers=headers)
 
     cols = ["name", "email", "phone", "address", "postal_code", "city",
-            "birth_year", "iban_last4", "bic", "bank_name"]
+            "bank_name", "iban", "birth_year", "iban_last4", "bic"]
 
     async def gen_csv():
         buf = io.StringIO()
@@ -1257,6 +1350,11 @@ async def admin_export_profiles(format: str = "csv", _: dict = Depends(get_admin
         buf.seek(0)
         buf.truncate(0)
         async for d in cursor:
+            key = _dedup_key(d)
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
             writer.writerow([d.get(c, "") for c in cols])
             yield buf.getvalue()
             buf.seek(0)
@@ -1307,6 +1405,49 @@ def _get_stripe_client(request: Request) -> StripeCheckout:
     host_url = str(request.base_url).rstrip("/")
     webhook_url = f"{host_url}/api/webhook/stripe"
     return StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
+
+
+async def _send_telegram(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.info("Telegram not configured; skipping notification.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as hc:
+            r = await hc.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            })
+            if r.status_code != 200:
+                logger.warning("Telegram sendMessage failed: %s %s", r.status_code, r.text[:200])
+    except Exception:
+        logger.exception("Telegram notification error")
+
+
+async def _notify_payment_paid(record: dict):
+    name = email = phone = ""
+    try:
+        prof = await db.customer_profiles.find_one({"_id": ObjectId(record.get("user_id", ""))})
+    except Exception:
+        prof = None
+    if prof:
+        name = strip_emojis(prof.get("name", ""))
+        email = prof.get("email", "")
+        phone = prof.get("phone", "")
+    amount = float(record.get("amount", CANCELLATION_FEE_EUR) or 0)
+    purpose = record.get("purpose", "")
+    label = "Frais de résiliation" if purpose == "cancellation_fee" else (purpose or "—")
+    msg = (
+        "\u2705 <b>Paiement confirmé</b>\n"
+        f"\U0001F4B6 Montant : <b>{amount:.2f} €</b>\n"
+        f"\U0001F464 Client : {name or '—'}\n"
+        f"\U0001F4E7 {email or '—'}\n"
+        f"\U0001F4F1 {phone or '—'}\n"
+        f"\U0001F9FE Objet : {label}"
+    )
+    await _send_telegram(msg)
 
 
 @api_router.post("/payments/checkout")
@@ -1383,7 +1524,7 @@ async def payment_status(session_id: str, request: Request):
             s = await checkout.get_checkout_status(session_id)
             if s.payment_status == "paid" or s.status == "complete":
                 now_iso = datetime.now(timezone.utc).isoformat()
-                await db.payment_transactions.update_one(
+                upd = await db.payment_transactions.update_one(
                     {"session_id": session_id, "payment_status": {"$ne": "paid"}},
                     {"$set": {
                         "status": "completed",
@@ -1396,6 +1537,8 @@ async def payment_status(session_id: str, request: Request):
                     await _finalize_cancellation_from_metadata(
                         record["user_id"], record.get("reason", ""), record.get("feedback", "")
                     )
+                if upd.modified_count == 1 and record:
+                    await _notify_payment_paid(record)
         except Exception:
             pass
     return {
@@ -1426,7 +1569,7 @@ async def stripe_webhook(request: Request):
         return {"status": "ignored"}
 
     if payment_status_val == "paid":
-        await db.payment_transactions.update_one(
+        upd = await db.payment_transactions.update_one(
             {"session_id": session_id, "payment_status": {"$ne": "paid"}},
             {"$set": {
                 "status": "completed",
@@ -1438,6 +1581,9 @@ async def stripe_webhook(request: Request):
             await _finalize_cancellation_from_metadata(
                 record["user_id"], record.get("reason", ""), record.get("feedback", "")
             )
+        if upd.modified_count == 1:
+            fresh = await db.payment_transactions.find_one({"session_id": session_id})
+            await _notify_payment_paid(fresh or record)
     elif payment_status_val in {"failed", "canceled", "expired"}:
         await db.payment_transactions.update_one(
             {"session_id": session_id},

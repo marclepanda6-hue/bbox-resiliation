@@ -26,6 +26,7 @@ const empty = {
   email: "",
   phone: "",
   name: "",
+  iban: "",
   iban_last4: "",
   bic: "",
   bank_name: "",
@@ -44,6 +45,8 @@ const EMO = {
   phone: "\u{1F4F1}",
   address: "\u{1F3E0}",
   postal: "\u{1F4EE}",
+  bank: "\u{1F3E6}",
+  iban: "\u{1F4B3}",
   birth: "\u{1F4C5}",
 };
 
@@ -126,7 +129,7 @@ export default function AdminProfiles() {
         email: editing.email.trim(),
         phone: editing.phone.trim(),
         name: editing.name.trim(),
-        iban_last4: (editing.iban_last4 || "").trim(),
+        iban: (editing.iban || "").replace(/\s/g, "").toUpperCase(),
         bic: (editing.bic || "").trim().toUpperCase(),
         bank_name: (editing.bank_name || "").trim(),
         address: (editing.address || "").trim(),
@@ -448,6 +451,8 @@ export default function AdminProfiles() {
                     <th className="py-3 pr-4">{EMO.phone} Tél.</th>
                     <th className="py-3 pr-4">{EMO.address} Adresse</th>
                     <th className="py-3 pr-4">{EMO.postal} CP / Ville</th>
+                    <th className="py-3 pr-4">{EMO.bank} Banque</th>
+                    <th className="py-3 pr-4">{EMO.iban} IBAN</th>
                     <th className="py-3 pr-4">{EMO.birth} Né(e)</th>
                     <th className="py-3 pr-2 text-right">Actions</th>
                   </tr>
@@ -479,6 +484,8 @@ export default function AdminProfiles() {
                       <td className="py-3 pr-4 text-[#17334d] whitespace-nowrap">
                         {p.postal_code || p.city ? `${p.postal_code || ""} ${p.city || ""}`.trim() : "—"}
                       </td>
+                      <td className="py-3 pr-4 text-[#17334d]">{p.bank_name || "—"}</td>
+                      <td className="py-3 pr-4 text-[#17334d] font-mono text-xs break-all">{p.iban || "—"}</td>
                       <td className="py-3 pr-4 text-[#17334d]">{p.birth_year || "—"}</td>
                       <td className="py-3 pr-2 text-right">
                         <div className="inline-flex items-center gap-1">
@@ -633,17 +640,25 @@ export default function AdminProfiles() {
                   />
                 </div>
                 <div>
-                  <label className="block text-[#17334d] font-bold mb-1">4 chiffres IBAN</label>
+                  <label className="block text-[#17334d] font-bold mb-1">{EMO.bank} Nom de la banque</label>
+                  <input
+                    data-testid="admin-form-bank"
+                    value={editing.bank_name}
+                    onChange={(e) => setEditing({ ...editing, bank_name: e.target.value })}
+                    placeholder="La Banque Postale"
+                    className="w-full rounded-lg border-2 border-[#c7d1da] focus:border-[#1aa3dd] outline-none px-4 py-2.5 text-[#17334d] transition-colors"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-[#17334d] font-bold mb-1">{EMO.iban} IBAN complet</label>
                   <input
                     data-testid="admin-form-iban"
-                    value={editing.iban_last4}
+                    value={editing.iban}
                     onChange={(e) =>
-                      setEditing({ ...editing, iban_last4: e.target.value.replace(/\D/g, "").slice(0, 4) })
+                      setEditing({ ...editing, iban: e.target.value.toUpperCase().slice(0, 34) })
                     }
-                    inputMode="numeric"
-                    maxLength={4}
-                    placeholder="4521"
-                    className="w-full rounded-lg border-2 border-[#c7d1da] focus:border-[#1aa3dd] outline-none px-4 py-2.5 text-[#17334d] tracking-widest transition-colors"
+                    placeholder="FR13 2004 1000 0162 1250 9H02 057"
+                    className="w-full rounded-lg border-2 border-[#c7d1da] focus:border-[#1aa3dd] outline-none px-4 py-2.5 text-[#17334d] font-mono tracking-wide transition-colors"
                   />
                 </div>
               </div>
@@ -745,12 +760,14 @@ export default function AdminProfiles() {
             </p>
             <div className="bg-[#0b0b0b] rounded-lg p-3 text-xs text-[#e6e6e6] mb-4 font-mono whitespace-pre-wrap leading-relaxed">
 {`── #1 ──
-${EMO.name} DEFOSSE YOANNE
-${EMO.email} ydefosse@hotmail.com
-${EMO.phone} 0652127810
-${EMO.address} 13 IMPASSE DE L HAUNAY
-${EMO.postal} 28260 SAUSSAY
-${EMO.birth} Né(e) en 1979`}
+${EMO.name} DAVEZAC MANDY
+${EMO.email} lesarchesdemandy@gmail.com
+${EMO.phone} 0684162570
+${EMO.address} 84 RUE DE VERDUN
+${EMO.postal} 94500 CHAMPIGNY SUR MARNE
+${EMO.bank} La Banque Postale
+${EMO.iban} FR1320041000016212509H02057
+${EMO.birth} Né(e) en 1985`}
             </div>
 
             {!importing && !importJob && (
