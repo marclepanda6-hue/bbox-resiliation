@@ -20,13 +20,35 @@
 
 ## Panel admin (`/admin/profils`)
 - Visible uniquement si `role=admin` (lien dans l'en-tête du dashboard).
-- CRUD complet des profils (email, téléphone, nom, 4 derniers chiffres IBAN).
-- **Import en masse** multi-format :
+- CRUD complet des profils (nom, email, téléphone, adresse, CP, ville, année de
+  naissance, 4 derniers chiffres IBAN, BIC/banque).
+- **Pagination serveur** (50/page) + recherche serveur (`?skip=&limit=&q=`) — tient le gros volume.
+- **Import en masse multi-format** (traitement en arrière-plan, barre de progression) :
   - Via fichier (`.csv`, `.txt`, `.tsv`) ou texte collé.
-  - Tous les séparateurs acceptés : virgule, point-virgule, pipe, tabulation, espaces.
-  - Classification heuristique des jetons (email, téléphone, nombre à 4 chiffres, reste=nom).
-  - Lignes commençant par `#` ignorées.
-  - Upsert sur email ou téléphone existant.
+  - **Format par blocs** : enregistrements séparés par `#1`, `#2`… (ou lignes vides),
+    une info par ligne préfixée d'un emoji (👤 nom, 📧 email, 📱 tél, 🏠 adresse,
+    📮 CP+ville, 📅 année de naissance). Détection auto.
+  - **Format tableau (horizontal)** : virgule, point-virgule, pipe, tabulation, espaces.
+  - **Dédoublonnage** automatique (clé email, sinon téléphone) + upsert en base.
+  - Insertion par lots de 1000 (`bulk_write` upsert) → pas de freeze même à ~1M lignes.
+- **Export en streaming** (`/export?format=csv|txt`) depuis un curseur Mongo → gère 500k+
+  sans charger en mémoire. TXT = format blocs ré-importable.
+- **Suppressions** : par ligne, sélection multiple, par plage (ex : lignes 1→28000), ou tout vider.
+- **Emojis** : les valeurs stockées sont nettoyées (sans emoji) → le client ne voit jamais
+  d'emoji ; l'admin voit des emojis **décoratifs** en en-tête de colonnes/champs.
+
+## Nouveaux champs profil
+- `address`, `postal_code`, `city`, `birth_year` (en plus de email/phone/name/iban_last4/bic/bank_name).
+
+## Déploiement
+- Emergent : supervisor (backend 8001, frontend 3000). `backend/.env` + `frontend/.env` requis.
+- Railway : `Dockerfile` à la racine (service unique, FastAPI sert le build React).
+  Voir `DEPLOY_RAILWAY.md` pour les variables (`MONGO_URL`, `DB_NAME`, `JWT_SECRET`,
+  `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `STRIPE_API_KEY`).
+
+## Stripe (sécurité carte)
+- Paiement via **Stripe Checkout hébergé** : le numéro de carte ne transite jamais par le
+  backend/frontend (seule une `session_id` est échangée).
 
 ## Dashboard utilisateur (`/espace-client`)
 - Affiche le nom du titulaire + 4 derniers chiffres IBAN récupérés depuis `customer_profiles`

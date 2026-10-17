@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
-import { LogOut, User, Landmark, Tv, CalendarClock, Shield, Smartphone, AlertCircle } from "lucide-react";
+import { LogOut, User, Landmark, Tv, CalendarClock, Shield, Smartphone, AlertCircle, MapPin } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { BrandLogo } from "@/components/BrandLogo";
 
@@ -112,7 +112,40 @@ export default function Dashboard() {
             <p className="text-[#17334d] font-bold text-xl mt-1" data-testid="full-name">
               {fullName}
             </p>
+            {user.birth_year && (
+              <p className="text-[#5a6b7a] text-sm mt-1" data-testid="birth-year">
+                Né(e) en {user.birth_year}
+              </p>
+            )}
           </motion.section>
+
+          {/* Adresse — hidden if none */}
+          {(user.address || user.city || user.postal_code) && (
+            <motion.section
+              data-testid="section-adresse"
+              initial={{ opacity: 0, y: 18 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.07 }}
+              className="bg-white rounded-2xl p-5 shadow-[0_8px_24px_rgba(22,65,148,0.08)]"
+            >
+              <div className="w-11 h-11 rounded-full bg-[#1aa3dd]/10 flex items-center justify-center mb-3">
+                <MapPin size={22} className="text-[#164194]" />
+              </div>
+              <h2 className="text-[#8a98a6] font-semibold text-sm uppercase tracking-wide">
+                Adresse
+              </h2>
+              {user.address && (
+                <p className="text-[#17334d] font-bold text-lg mt-1" data-testid="address-line">
+                  {user.address}
+                </p>
+              )}
+              {(user.postal_code || user.city) && (
+                <p className="text-[#17334d] mt-0.5" data-testid="city-line">
+                  {`${user.postal_code || ""} ${user.city || ""}`.trim()}
+                </p>
+              )}
+            </motion.section>
+          )}
 
           {/* Ligne mobile — hidden if no phone */}
           {hasPhone && (

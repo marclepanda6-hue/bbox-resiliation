@@ -1,0 +1,14 @@
+**/node_modules
+frontend/build
+frontend/.env
+backend/.env
+**/__pycache__
+**/*.pyc
+.git
+.emergent
+test_reports
+tests
+backend_test.py
+backend_test_cors_iban.py
+test_result.md
+*.md

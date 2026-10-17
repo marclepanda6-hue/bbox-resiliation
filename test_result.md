@@ -138,6 +138,81 @@ backend:
           agent: "testing"
           comment: "✅ PASSED (6/6 tests). Import with full IBANs working correctly. Tested 3 profiles with full IBANs: FR76 3000 4000 0000 0000 4521 → iban_last4='4521', FR7612345678901234567891234 → iban_last4='1234', GB82 WEST 1234 5698 7654 32 → iban_last4='5432'. All profiles created successfully. Login and /api/auth/me return correct iban_masked with new FR76 format."
 
+  - task: "Import multi-format v2 : format par blocs (#N + emojis) + horizontal, nouveaux champs adresse/CP/ville/année de naissance, nettoyage emojis"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "parse_import_text détecte automatiquement le format bloc (séparateurs #1/#2 ou lignes vides, une info par ligne préfixée d'un emoji) OU le format horizontal (CSV/TSV/;/|/espaces). Nouveaux champs stockés: address, postal_code, city, birth_year. Tous les emojis sont retirés des valeurs stockées (strip_emojis) donc le client ne voit jamais d'emoji. Dédoublonnage au sein du lot (clé email sinon phone). Testé en isolation sur la capture fournie (2 blocs) + format sans # + CSV + doublons → OK."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED (15/15 tests). Block format import working perfectly. Tested with exact format from review request (── #1 ──, emojis 👤📧📱🏠📮📅). Imported 2 profiles (DEFOSSE YOANNE, CANALES ALICIA). CRITICAL: NO emojis in stored values - verified name='DEFOSSE YOANNE' (not '👤 DEFOSSE YOANNE'), email='ydefosse@hotmail.com', phone='0652127810', address='13 IMPASSE DE L HAUNAY', postal_code='28260', city='SAUSSAY', birth_year='1979'. All fields correctly extracted and cleaned. Horizontal CSV format also works (created >= 1 profile). Deduplication working: two records with same email → only ONE profile exists."
+
+  - task: "Import en arrière-plan (job + progression) pour gros volumes (jusqu'à ~1M sans freeze)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "POST /api/admin/profiles/import et /import-file renvoient {job_id} immédiatement. Le parsing (asyncio.to_thread) + l'insertion par lots de 1000 (bulk_write UpdateOne upsert, ordered=False) tournent en tâche de fond. GET /api/admin/profiles/import-status/{job_id} renvoie status/total/processed/created/updated/errors/error_samples/message."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED (4/4 tests). Background import jobs working correctly. POST /api/admin/profiles/import returns {job_id} immediately. Polling GET /api/admin/profiles/import-status/{job_id} works until status='done'. Tested with block format and CSV format. POST /api/admin/profiles/import-file (multipart) also returns {job_id} and completes successfully. Job status correctly reports created/updated counts."
+
+  - task: "Pagination serveur + recherche GET /api/admin/profiles?skip=&limit=&q="
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Retourne {profiles, total, skip, limit}. Tri par _id ascendant (= numéro de ligne). Recherche regex insensible à la casse sur email/phone/name/city/postal_code. limit borné à 500."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED (5/5 tests). Pagination working correctly. GET /api/admin/profiles?skip=0&limit=50&q= returns {profiles, total, skip, limit} with correct values. Without cookie returns 401. With non-admin session returns 403. All auth checks working properly."
+
+  - task: "Suppressions : all / bulk / range"
+    implemented: true
+    working: false
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "DELETE /api/admin/profiles/all (vide tout). POST /api/admin/profiles/delete-bulk {ids:[...]}. POST /api/admin/profiles/delete-range {start,end} (positions 1-based dans l'ordre _id ascendant, bornes incluses). Admin seulement."
+        - working: false
+          agent: "testing"
+          comment: "❌ CRITICAL BUG: DELETE /api/admin/profiles/all returns 400 'Identifiant de profil invalide.' instead of 200. ROOT CAUSE: Route ordering issue in backend/server.py. The route DELETE /admin/profiles/{profile_id} (line 776) is defined BEFORE DELETE /admin/profiles/all (line 797), so FastAPI matches 'all' as a profile_id parameter. FIX: Move DELETE /admin/profiles/all route BEFORE DELETE /admin/profiles/{profile_id} route. ✅ delete-bulk and delete-range working correctly (deleted=2, deleted=1). ✅ All auth checks working (403 for non-admin, 401 without auth)."
+
+  - task: "Export en streaming GET /api/admin/profiles/export?format=csv|txt"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "StreamingResponse depuis un curseur Mongo (batch_size 1000) — gère 500k+ sans charger en mémoire. CSV (colonnes name,email,phone,address,postal_code,city,birth_year,iban_last4,bic,bank_name) ou TXT (format blocs #N avec emojis, re-importable)."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED (7/7 tests). Export streaming working correctly. GET /api/admin/profiles/export?format=csv returns 200 with Content-Type text/csv, Content-Disposition attachment, and correct CSV header row (name,email,phone,address,postal_code,city,birth_year,iban_last4,bic,bank_name). GET ...?format=txt returns 200 with Content-Type text/plain and Content-Disposition attachment. Both formats stream correctly."
+
 frontend:
   - task: "Login: placeholder email/téléphone, suppression du lien 'Première connexion'"
     implemented: true
@@ -182,12 +257,92 @@ metadata:
   run_ui: false
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "Import multi-format v2 : format par blocs (#N + emojis) + horizontal, nouveaux champs adresse/CP/ville/année de naissance, nettoyage emojis"
+    - "Import en arrière-plan (job + progression) pour gros volumes (jusqu'à ~1M sans freeze)"
+    - "Pagination serveur + recherche GET /api/admin/profiles?skip=&limit=&q="
+    - "Suppressions : all / bulk / range"
+    - "Export en streaming GET /api/admin/profiles/export?format=csv|txt"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
 
 agent_communication:
+    - agent: "main"
+      message: |
+        Nouvelle itération (import/export gros volumes + nouveaux champs + Railway + .env restauré).
+        Les fichiers backend/.env et frontend/.env étaient ABSENTS sur ce conteneur repris (crash
+        KeyError MONGO_URL). Je les ai recréés (MONGO_URL local, DB_NAME=espace_client, admin du PRD).
+        Mongo était vide, l'admin est re-seedé au startup.
+
+        À TESTER (backend uniquement pour l'instant) — admin: dacostakanan@gmail.com / 24689100?C :
+        1. GET /api/admin/profiles?skip=&limit=&q= → {profiles,total,skip,limit}, tri _id asc, recherche.
+        2. POST /api/admin/profiles/import {text} → {job_id}. Puis GET /import-status/{job_id} jusqu'à
+           status=done. Tester le FORMAT PAR BLOCS (séparateurs #1/#2, lignes préfixées d'emojis
+           👤 📧 📱 🏠 📮 📅) : vérifier que name/email/phone/address/postal_code/city/birth_year sont
+           bien extraits ET SANS EMOJI dans les valeurs. Tester aussi le format horizontal CSV.
+        3. Dédoublonnage : deux blocs avec le même email → un seul profil créé.
+        4. POST /api/admin/profiles/import-file (multipart champ `file`) idem.
+        5. DELETE /api/admin/profiles/all ; POST /delete-bulk {ids} ; POST /delete-range {start,end}
+           (bornes 1-based incluses sur l'ordre _id asc). 403 pour non-admin sur tous ces endpoints.
+        6. GET /api/admin/profiles/export?format=csv et ?format=txt → 200, contenu en streaming,
+           header Content-Disposition attachment.
+        7. Login d'un profil importé par email OU téléphone (mot de passe quelconque) → /api/auth/me
+           doit renvoyer name/address/city/birth_year nettoyés (aucun emoji) + iban_masked.
+        NE PAS retester les anciens points déjà verts sauf régression évidente.
+    
+    - agent: "testing"
+      message: |
+        ✅ BACKEND TESTING COMPLETE (54/57 tests passed)
+        
+        TESTED NEW FEATURES (iteration #5):
+        
+        1. ✅ Pagination + Search (5/5 tests)
+           - GET /api/admin/profiles?skip=0&limit=50&q= returns correct structure
+           - Auth checks working (401 without cookie, 403 for non-admin)
+        
+        2. ✅ Block Format Import with Emojis - MAIN FEATURE (15/15 tests)
+           - Imported 2 profiles with exact format from review request
+           - CRITICAL: NO emojis in stored values verified
+           - name='DEFOSSE YOANNE' (not '👤 DEFOSSE YOANNE')
+           - All fields extracted correctly: email, phone, address, postal_code, city, birth_year
+        
+        3. ✅ Horizontal CSV Import (2/2 tests)
+           - CSV format still works, created >= 1 profile
+        
+        4. ✅ Deduplication (4/4 tests)
+           - Two records with same email → only ONE profile exists
+           - Kept last record's data (DUPONT MARIE)
+        
+        5. ✅ Import File (multipart) (2/2 tests)
+           - POST /api/admin/profiles/import-file with .txt file works
+           - Job completes successfully
+        
+        6. ❌ Deletions (8/10 tests) - ONE CRITICAL BUG
+           - ✅ delete-bulk working (deleted=2)
+           - ✅ delete-range working (deleted=1)
+           - ❌ DELETE /api/admin/profiles/all returns 400 instead of 200
+           - ROOT CAUSE: Route ordering bug in backend/server.py
+           - DELETE /admin/profiles/{profile_id} (line 776) defined BEFORE
+             DELETE /admin/profiles/all (line 797)
+           - FastAPI matches 'all' as profile_id parameter
+           - FIX: Move /all route BEFORE /{profile_id} route
+           - ✅ All auth checks working (403 for non-admin, 401 without auth)
+        
+        7. ✅ Export Streaming (7/7 tests)
+           - CSV export: correct Content-Type, headers, CSV structure
+           - TXT export: correct Content-Type, headers
+        
+        8. ✅ Profile Login + Emoji Cleanup (8/9 tests)
+           - Profile login with email/phone works
+           - /api/auth/me returns data WITHOUT emojis
+           - name='BERNARD CLAIRE', address='5 RUE DU TEST', city='LYON', birth_year='1988'
+           - Minor: iban_masked empty (profile imported without iban_last4 - expected)
+        
+        CRITICAL BUG TO FIX:
+        - DELETE /api/admin/profiles/all route ordering issue
+        
+        ALL OTHER FEATURES WORKING CORRECTLY.
     - agent: "main"
       message: |
         Nouveau modèle d'auth : admin unique en base users (dacostakanan@gmail.com / 24689100?C,
