@@ -46,7 +46,7 @@ def test_cors_preflight():
     # Test origins that MUST be allowed
     allowed_origins = [
         "https://reset-abonnement.deployed.emergentagent.com",
-        "https://foo.preview.emergentagent.com",
+        "https://gestion-clients-app.preview.emergentagent.com",
         "https://bar.emergent.host",
         "http://localhost:3000",
         "http://localhost:5173",

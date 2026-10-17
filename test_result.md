@@ -304,7 +304,7 @@ agent_communication:
         1. CORS Fix (26/26 tests) ✅ — PRIMARY FOCUS
            - Preflight OPTIONS requests work for all required origins:
              • https://reset-abonnement.deployed.emergentagent.com ✅
-             • https://foo.preview.emergentagent.com ✅
+             • https://gestion-clients-app.preview.emergentagent.com ✅
              • https://bar.emergent.host ✅
              • http://localhost:3000 ✅
              • http://localhost:5173 ✅
