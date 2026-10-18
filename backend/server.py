@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import UpdateOne
-from pymongo.errors import BulkWriteError
+from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure
 from pydantic import BaseModel, Field
 
 from emergentintegrations.payments.stripe.checkout import (
@@ -1139,26 +1139,67 @@ def _parse_horizontal(text):
 
 def parse_import_text(text):
     """Accept ANY format: the vertical emoji/block format OR the horizontal
-    (one line per record) format. Returns a de-duplicated list of profile dicts."""
+    (one line per record) format. Merge records sharing an email or phone."""
     lines = (text or "").splitlines()
     if _looks_like_block_format(lines):
         rows = _parse_blocks(text)
     else:
         rows = _parse_horizontal(text)
-    # De-duplicate within the batch (keep last occurrence) by email, else phone.
-    seen = {}
-    order = []
+
+    # Merge repeated identities while keeping ambiguous email/phone collisions
+    # as explicit skipped rows instead of silently combining two profiles.
+    records = []
+    by_email = {}
+    by_phone = {}
+    conflicts = []
+
     for r in rows:
-        if r.get("email"):
-            key = "e:" + r["email"]
-        elif r.get("phone"):
-            key = "p:" + r["phone"]
-        else:
+        row = dict(r)
+        email = _normalize_email(row.get("email", ""))
+        phone = _normalize_phone(row.get("phone", ""))
+        row["email"], row["phone"] = email, phone
+        if not email and not phone:
             continue
-        if key not in seen:
-            order.append(key)
-        seen[key] = r
-    return [seen[k] for k in order]
+
+        email_index = by_email.get(email) if email else None
+        phone_index = by_phone.get(phone) if phone else None
+        if email_index is not None and phone_index is not None and email_index != phone_index:
+            row["_import_conflict"] = True
+            conflicts.append(row)
+            continue
+        if (phone_index is not None and email_index is None and email and
+                records[phone_index].get("email") and records[phone_index]["email"] != email):
+            row["_import_conflict"] = True
+            conflicts.append(row)
+            continue
+
+        index = email_index if email_index is not None else phone_index
+        if index is None:
+            index = len(records)
+            records.append(row)
+            old_email, old_phone = email, phone
+        else:
+            target = records[index]
+            old_email, old_phone = target.get("email", ""), target.get("phone", "")
+            for field, value in row.items():
+                if value and field != "_import_conflict":
+                    target[field] = value
+
+        # A repeated email may contain an updated phone. Remove the old alias
+        # so later rows are matched only to the identity now being retained.
+        for aliases, old_value, new_value in (
+            (by_email, old_email, email),
+            (by_phone, old_phone, phone),
+        ):
+            if old_value and new_value and old_value != new_value and aliases.get(old_value) == index:
+                aliases.pop(old_value, None)
+
+        if email:
+            by_email[email] = index
+        if phone:
+            by_phone[phone] = index
+
+    return records + conflicts
 
 
 # ---------- import jobs (background, large-volume safe) ----------
@@ -1170,27 +1211,129 @@ def _new_job():
     job_id = uuid.uuid4().hex
     IMPORT_JOBS[job_id] = {
         "job_id": job_id, "status": "parsing", "total": 0,
-        "processed": 0, "created": 0, "updated": 0, "errors": 0,
+        "processed": 0, "created": 0, "updated": 0, "duplicates": 0, "errors": 0,
         "error_samples": [], "message": "",
     }
     return job_id
 
 
 async def _flush_batch(job, batch):
+    if not batch:
+        return
+
+    emails = sorted({item["email"] for item in batch if item["email"]})
+    phones = sorted({item["phone"] for item in batch if item["phone"]})
+    clauses = []
+    if emails:
+        clauses.append({"email": {"$in": emails}})
+    if phones:
+        clauses.append({"phone": {"$in": phones}})
+
+    by_email, by_phone = {}, {}
+    if clauses:
+        cursor = db.customer_profiles.find(
+            {"$or": clauses}, {"_id": 1, "email": 1, "phone": 1}
+        )
+        async for profile in cursor:
+            if profile.get("email"):
+                by_email.setdefault(profile["email"], []).append(profile)
+            if profile.get("phone"):
+                by_phone.setdefault(profile["phone"], []).append(profile)
+
+    operations, operation_rows = [], []
+    for item in batch:
+        email, phone, doc = item["email"], item["phone"], item["doc"]
+        email_matches = by_email.get(email, [])
+        phone_matches = by_phone.get(phone, [])
+        email_ids = {p["_id"] for p in email_matches}
+        phone_ids = {p["_id"] for p in phone_matches}
+
+        if email_matches and phone_matches:
+            common_ids = email_ids & phone_ids
+            if not common_ids:
+                job["duplicates"] += 1
+                if len(job["error_samples"]) < 20:
+                    job["error_samples"].append({
+                        "error": "Ligne ignorée : l’email et le téléphone appartiennent à deux profils différents."
+                    })
+                continue
+            matched_id = next(iter(common_ids))
+            existing = next(p for p in email_matches + phone_matches if p["_id"] == matched_id)
+        elif email_matches:
+            existing = email_matches[0]
+        elif phone_matches:
+            existing = phone_matches[0]
+            if (email and existing.get("email") and
+                    existing["email"] != email):
+                job["duplicates"] += 1
+                if len(job["error_samples"]) < 20:
+                    job["error_samples"].append({
+                        "error": "Ligne ignorée : ce téléphone est déjà rattaché à un autre email."
+                    })
+                continue
+        else:
+            existing = None
+
+        if existing:
+            updates = {key: value for key, value in doc.items() if value not in (None, "")}
+            operations.append(UpdateOne({"_id": existing["_id"]}, {"$set": updates}))
+        else:
+            identity = {"email": email} if email else {"phone": phone}
+            operations.append(UpdateOne(identity, {"$set": doc}, upsert=True))
+        operation_rows.append(item)
+
     try:
-        res = await db.customer_profiles.bulk_write(batch, ordered=False)
-        job["created"] += (res.upserted_count or 0)
-        job["updated"] += (res.modified_count or 0)
+        if operations:
+            result = await db.customer_profiles.bulk_write(operations, ordered=False)
+            job["created"] += result.upserted_count or 0
+            job["updated"] += result.matched_count or 0
     except BulkWriteError as bwe:
-        wr = bwe.details or {}
-        job["created"] += wr.get("nUpserted", 0)
-        job["updated"] += wr.get("nModified", 0)
-        errs = wr.get("writeErrors", [])
-        job["errors"] += len(errs)
-        for e in errs[: max(0, 20 - len(job["error_samples"]))]:
-            job["error_samples"].append({"error": (e.get("errmsg", "Erreur d'écriture") or "")[:160]})
+        details = bwe.details or {}
+        job["created"] += details.get("nUpserted", 0)
+        job["updated"] += details.get("nMatched", 0)
+        for error in details.get("writeErrors", []):
+            index = error.get("index", -1)
+            item = operation_rows[index] if 0 <= index < len(operation_rows) else None
+            if error.get("code") == 11000 and item:
+                # Another import may have inserted this identity after preflight.
+                email, phone = item["email"], item["phone"]
+                found_by_email = await db.customer_profiles.find_one({"email": email}) if email else None
+                found_by_phone = await db.customer_profiles.find_one({"phone": phone}) if phone else None
+                if (found_by_email and found_by_phone and
+                        found_by_email["_id"] != found_by_phone["_id"]):
+                    job["duplicates"] += 1
+                    message = "Ligne ignorée : l’email et le téléphone appartiennent à deux profils différents."
+                elif (found_by_phone and not found_by_email and email and
+                      found_by_phone.get("email") and found_by_phone["email"] != email):
+                    job["duplicates"] += 1
+                    message = "Ligne ignorée : ce téléphone est déjà rattaché à un autre email."
+                else:
+                    winner = found_by_email or found_by_phone
+                    if winner:
+                        try:
+                            updates = {
+                                key: value for key, value in item["doc"].items()
+                                if value not in (None, "")
+                            }
+                            await db.customer_profiles.update_one(
+                                {"_id": winner["_id"]}, {"$set": updates}
+                            )
+                            job["updated"] += 1
+                            continue
+                        except DuplicateKeyError:
+                            pass
+                    job["duplicates"] += 1
+                    message = "Ligne ignorée : cet email ou téléphone est déjà associé à un autre profil."
+                if len(job["error_samples"]) < 20:
+                    job["error_samples"].append({"error": message})
+            else:
+                job["errors"] += 1
+                if len(job["error_samples"]) < 20:
+                    job["error_samples"].append({
+                        "error": (error.get("errmsg", "Erreur d’écriture") or "")[:160]
+                    })
     finally:
-        job["processed"] = job["created"] + job["updated"] + job["errors"]
+        job["processed"] += len(batch)
 
 
 async def _run_import_job(job_id, text):
@@ -1208,8 +1351,17 @@ async def _run_import_job(job_id, text):
         for row in parsed:
             email = row.get("email", "")
             phone = row.get("phone", "")
+            if row.get("_import_conflict"):
+                job["duplicates"] += 1
+                job["processed"] += 1
+                if len(job["error_samples"]) < 20:
+                    job["error_samples"].append({
+                        "error": "Ligne ignorée : email ou téléphone déjà rattaché à un autre profil du fichier."
+                    })
+                continue
             if email and not _looks_like_email(email):
                 job["errors"] += 1
+                job["processed"] += 1
                 if len(job["error_samples"]) < 20:
                     job["error_samples"].append({"error": f"Email invalide : {email}"})
                 continue
@@ -1231,8 +1383,7 @@ async def _run_import_job(job_id, text):
                 "birth_year": row.get("birth_year", ""),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
-            flt = {"email": email} if email else {"phone": phone}
-            batch.append(UpdateOne(flt, {"$set": doc}, upsert=True))
+            batch.append({"email": email, "phone": phone, "doc": doc})
             if len(batch) >= _IMPORT_BATCH:
                 await _flush_batch(job, batch)
                 batch = []
@@ -1640,12 +1791,27 @@ async def startup():
     await db.users.create_index("email", unique=True)
     await db.login_attempts.create_index("identifier")
     # customer_profiles: partial unique indexes so empty/missing values don't collide
-    await db.customer_profiles.create_index(
-        "email", unique=True, partialFilterExpression={"email": {"$gt": ""}}
-    )
-    await db.customer_profiles.create_index(
-        "phone", unique=True, partialFilterExpression={"phone": {"$gt": ""}}
-    )
+    for field in ("email", "phone"):
+        try:
+            await db.customer_profiles.create_index(
+                field, unique=True, partialFilterExpression={field: {"$gt": ""}}
+            )
+        except DuplicateKeyError:
+            # Keep the service online on legacy data; the importer checks for
+            # identity conflicts itself and reports them as skipped rows.
+            logger.warning(
+                "Unique %s index was not created: duplicate customer profile values exist.",
+                field,
+            )
+        except OperationFailure as exc:
+            # A pre-existing index with incompatible options must not prevent
+            # Railway from starting; only index-specific conflicts are ignored.
+            if exc.code not in (85, 86):
+                raise
+            logger.warning(
+                "Unique %s index was not changed because an incompatible index exists.",
+                field,
+            )
     # Drop legacy index if it exists
     try:
         await db.customer_profiles.drop_index("identifier_1")

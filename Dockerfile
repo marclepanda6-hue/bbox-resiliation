@@ -5,7 +5,9 @@
 FROM node:20-alpine AS frontend
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/yarn.lock ./
-RUN yarn install --frozen-lockfile --network-timeout 600000
+RUN corepack enable \
+    && corepack prepare yarn@1.22.22 --activate \
+    && yarn install --frozen-lockfile --non-interactive --network-timeout 600000
 COPY frontend/ ./
 # Same-origin API calls in production: REACT_APP_BACKEND_URL stays empty so the
 # app calls "/api" on the same host that serves the static files.

@@ -260,7 +260,7 @@ export default function AdminProfiles() {
           setImporting(false);
           if (job.status === "done") {
             toast.success(
-              `Import terminé : ${job.created} créé(s), ${job.updated} mis à jour, ${job.errors} erreur(s)`
+              `Import terminé : ${job.created} créé(s), ${job.updated} mis à jour, ${job.duplicates || 0} doublon(s) ignoré(s), ${job.errors} erreur(s)`
             );
           } else {
             toast.error(job.message || "Import en erreur");
@@ -284,7 +284,7 @@ export default function AdminProfiles() {
       return;
     }
     setImporting(true);
-    setImportJob({ status: "parsing", total: 0, processed: 0, created: 0, updated: 0, errors: 0 });
+    setImportJob({ status: "parsing", total: 0, processed: 0, created: 0, updated: 0, duplicates: 0, errors: 0 });
     try {
       let res;
       if (importFile) {
@@ -826,6 +826,7 @@ ${EMO.birth} Né(e) en 1985`}
                 <div className="mt-3 text-sm text-[#17334d]">
                   <strong className="text-[#1b7a46]">{(importJob.created || 0).toLocaleString("fr-FR")}</strong> créé(s) ·{" "}
                   <strong>{(importJob.updated || 0).toLocaleString("fr-FR")}</strong> mis à jour ·{" "}
+                  <strong className="text-[#9a6700]">{(importJob.duplicates || 0).toLocaleString("fr-FR")}</strong> doublon(s) ignoré(s) ·{" "}
                   <strong className="text-[#c0392b]">{(importJob.errors || 0).toLocaleString("fr-FR")}</strong> erreur(s)
                 </div>
                 {importJob.message && (
