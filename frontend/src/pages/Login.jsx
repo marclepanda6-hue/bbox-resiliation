@@ -64,7 +64,7 @@ export default function Login() {
           initial={{ opacity: 0, scale: 0.92 }}
           animate={{ opacity: 1, scale: 1 }}
           transition={{ duration: 0.5, delay: 0.1 }}
-          className="pt-6 pb-2"
+          className="flex w-full justify-center pt-6 pb-2"
         >
           <BrandLogo markSize={58} />
         </motion.div>
