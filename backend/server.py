@@ -42,6 +42,7 @@ db = client[os.environ['DB_NAME']]
 
 # Stripe (BYOK via emergentintegrations)
 STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY") or "sk_test_emergent"
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 CANCELLATION_FEE_EUR = float(os.environ.get("CANCELLATION_FEE_EUR", "69.99"))
 
 # Telegram notifications (payment confirmations)
@@ -1555,7 +1556,11 @@ class CheckoutRequest(BaseModel):
 def _get_stripe_client(request: Request) -> StripeCheckout:
     host_url = str(request.base_url).rstrip("/")
     webhook_url = f"{host_url}/api/webhook/stripe"
-    return StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
+    return StripeCheckout(
+        api_key=STRIPE_API_KEY,
+        webhook_secret=STRIPE_WEBHOOK_SECRET or None,
+        webhook_url=webhook_url,
+    )
 
 
 async def _send_telegram(text: str):
@@ -1702,8 +1707,15 @@ async def payment_status(session_id: str, request: Request):
 
 @api_router.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        logger.error("Stripe webhook rejected: STRIPE_WEBHOOK_SECRET is not configured.")
+        raise HTTPException(503, "Webhook Stripe non configuré.")
+
     body = await request.body()
     sig = request.headers.get("Stripe-Signature", "")
+    if not sig:
+        raise HTTPException(400, "Signature Stripe manquante.")
+
     checkout = _get_stripe_client(request)
     try:
         event = await checkout.handle_webhook(body, sig)
