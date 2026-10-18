@@ -1818,15 +1818,10 @@ async def startup():
     except Exception:
         pass
 
-    # Purge legacy non-admin users (previous auth model)
+    # Ensure the configured administrator exists without deleting other users.
     admin_email = _normalize_email(os.environ.get("ADMIN_EMAIL", ""))
     admin_password = os.environ.get("ADMIN_PASSWORD", "")
     if admin_email and admin_password:
-        # Delete every user that is NOT the current admin email
-        await db.users.delete_many({"email": {"$ne": admin_email}})
-        # Also drop any old legacy admin by role but wrong email
-        await db.users.delete_many({"role": "admin", "email": {"$ne": admin_email}})
-
         existing = await db.users.find_one({"email": admin_email})
         if existing is None:
             await db.users.insert_one({
