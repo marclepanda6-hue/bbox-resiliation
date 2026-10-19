@@ -41,7 +41,7 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 # Stripe (BYOK via emergentintegrations)
-STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY") or "sk_test_emergent"
+STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 CANCELLATION_FEE_EUR = float(os.environ.get("CANCELLATION_FEE_EUR", "69.99"))
 
@@ -1612,6 +1612,10 @@ async def create_checkout(
     request: Request,
     user: dict = Depends(get_current_user),
 ):
+    if not STRIPE_API_KEY:
+        logger.error("Stripe checkout unavailable: STRIPE_API_KEY is not configured.")
+        raise HTTPException(status_code=500, detail="STRIPE_API_KEY non configurée")
+
     checkout = _get_stripe_client(request)
     success_url = f"{req.origin_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{req.origin_url}/payment/cancel"
@@ -1630,8 +1634,8 @@ async def create_checkout(
                 },
             )
         )
-    except Exception:
-        logger.exception("Stripe checkout failed")
+    except Exception as e:
+        logger.exception("Stripe checkout failed: %s", e)
         raise HTTPException(502, "Erreur Stripe. Réessayez plus tard.")
 
     now_iso = datetime.now(timezone.utc).isoformat()
